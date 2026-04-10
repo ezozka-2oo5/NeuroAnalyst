@@ -1,0 +1,9 @@
+numpy
+scipy
+pandas
+matplotlib
+streamlit
+reportlab
+scikit-learn
+PyQt5
+joblib
