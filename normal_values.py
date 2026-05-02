@@ -28,7 +28,7 @@ class LoginWindow(QWidget):
         self.initUI()
         
     def initUI(self):
-        self.setWindowTitle("NeuroAnalyst Pro - Kirish")
+        self.setWindowTitle("NeuroAnalyst - Kirish")
         self.setGeometry(500, 300, 400, 400)
         self.setStyleSheet("""
             QWidget {
@@ -63,7 +63,7 @@ class LoginWindow(QWidget):
         
         layout = QVBoxLayout()
         
-        title = QLabel("🧠 NeuroAnalyst Pro")
+        title = QLabel("🧠 NeuroAnalyst")
         title.setStyleSheet("font-size: 28px; font-weight: bold; color: #64ffda; padding: 20px;")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
@@ -140,7 +140,7 @@ class MainWindow(QMainWindow):
         self.initUI()
         
     def initUI(self):
-        self.setWindowTitle(f"NeuroAnalyst Pro - {self.login_system.current_user['name']}")
+        self.setWindowTitle(f"NeuroAnalyst - {self.login_system.current_user['name']}")
         self.setGeometry(100, 100, 1200, 800)
         
         self.setStyleSheet("""
@@ -196,7 +196,7 @@ class MainWindow(QMainWindow):
         header = QWidget()
         header_layout = QHBoxLayout(header)
         
-        title = QLabel("🧠 NeuroAnalyst Pro")
+        title = QLabel("🧠 NeuroAnalyst")
         title.setStyleSheet("font-size: 24px; font-weight: bold; color: #64ffda;")
         header_layout.addWidget(title)
         

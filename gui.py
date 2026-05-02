@@ -10,7 +10,7 @@ class TestWindow(QMainWindow):
         self.initUI()
         
     def initUI(self):
-        self.setWindowTitle("EEG Test")
+        self.setWindowTitle("NeuroAnalyst")
         self.setGeometry(200, 200, 800, 600)
         
         central = QWidget()
@@ -53,4 +53,4 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = TestWindow()
     window.show()
-    sys.exit(app.exec_())python gui.py
+    sys.exit(app.exec_())

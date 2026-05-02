@@ -1,6 +1,6 @@
-# NeuroAI EEG Analyzer
+# NeuroAnalyst
 
-NeuroAI EEG Analyzer - shifoxona sharoitida EEG signallarini avtomatik qayta ishlash va shifokor qarorini qo'llab-quvvatlash uchun tayyorlangan MVP platforma.
+NeuroAnalyst - shifoxona sharoitida EEG signallarini avtomatik qayta ishlash va shifokor qarorini qo'llab-quvvatlash uchun tayyorlangan MVP platforma.
 
 ## Nima qila oladi
 

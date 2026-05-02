@@ -8,6 +8,7 @@ os.makedirs(MPL_CONFIG_DIR, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", MPL_CONFIG_DIR)
 
 import numpy as np
+from scipy.signal import butter, filtfilt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt5.QtCore import Qt
@@ -28,6 +29,11 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    import mne
+except ImportError:
+    mne = None
 
 
 class LoginSystem:
@@ -57,7 +63,7 @@ class LoginWindow(QWidget):
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle("NeuroAnalyst Pro - Kirish")
+        self.setWindowTitle("NeuroAnalyst - Kirish")
         self.setFixedSize(520, 520)
         self.setStyleSheet(
             """
@@ -88,7 +94,7 @@ class LoginWindow(QWidget):
         layout.setSpacing(18)
         layout.setContentsMargins(48, 48, 48, 48)
 
-        title = QLabel("NeuroAnalyst Pro")
+        title = QLabel("NeuroAnalyst")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 30px; font-weight: bold; color: #64ffda;")
         layout.addWidget(title)
@@ -247,12 +253,15 @@ class MainWindow(QMainWindow):
         self.login_system = login_system
         self.raw_data = None
         self.filtered_data = None
+        self.sample_rate = 250.0
+        self.channel_names = []
+        self.loaded_source = "Test signal"
         self.age_normalizer = AgeNormalizer()
         self.ai_diagnosis = AIDiagnosis()
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle(f"NeuroAnalyst Pro - {self.login_system.current_user['name']}")
+        self.setWindowTitle(f"NeuroAnalyst - {self.login_system.current_user['name']}")
         self.setGeometry(100, 100, 1360, 860)
         self.setStyleSheet(
             """
@@ -310,7 +319,7 @@ class MainWindow(QMainWindow):
         header = QWidget()
         row = QHBoxLayout(header)
 
-        title = QLabel("NeuroAnalyst Pro")
+        title = QLabel("NeuroAnalyst")
         title.setStyleSheet("font-size: 24px; font-weight: bold; color: #64ffda;")
         row.addWidget(title)
         row.addStretch()
@@ -402,12 +411,38 @@ class MainWindow(QMainWindow):
         self.filter_button.setEnabled(True)
 
     def load_file(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "EEG faylini tanlang", "", "EDF files (*.edf)")
+        file_name, _ = QFileDialog.getOpenFileName(self, "EEG faylini tanlang", "", "EEG files (*.edf *.bdf)")
         if not file_name:
             return
-        self.status_label.setText(f"Holat: {file_name.split('/')[-1]} yuklandi. Demo signal tayyorlandi.")
-        self.create_test_signal()
-        self.filter_button.setEnabled(True)
+        if mne is None:
+            self.status_label.setText("Holat: MNE kutubxonasi topilmadi, EDF/BDF faylni o'qib bo'lmadi.")
+            return
+
+        try:
+            suffix = os.path.splitext(file_name)[1].lower()
+            reader = mne.io.read_raw_bdf if suffix == ".bdf" else mne.io.read_raw_edf
+            raw = reader(file_name, preload=True, verbose="ERROR")
+            eeg_picks = mne.pick_types(raw.info, eeg=True, exclude=[])
+            if len(eeg_picks):
+                raw.pick(eeg_picks)
+
+            data = raw.get_data() * 1e6
+            if data.size == 0:
+                raise RuntimeError("EEG kanal topilmadi.")
+
+            self.raw_data = np.asarray(data, dtype=float)
+            self.filtered_data = None
+            self.sample_rate = float(raw.info["sfreq"])
+            self.channel_names = list(raw.ch_names)
+            self.loaded_source = os.path.basename(file_name)
+            self.analyze_button.setEnabled(False)
+            self.filter_button.setEnabled(True)
+            self.plot_signals(filtered=False)
+            self.status_label.setText(
+                f"Holat: {self.loaded_source} yuklandi. {self.raw_data.shape[0]} kanal, {self.sample_rate:.1f} Hz."
+            )
+        except Exception as exc:
+            self.status_label.setText(f"Holat: faylni o'qishda xato: {exc}")
 
     def create_test_signal(self):
         sample_rate = 250
@@ -428,6 +463,9 @@ class MainWindow(QMainWindow):
 
         self.raw_data = np.asarray(signals)
         self.filtered_data = None
+        self.sample_rate = float(sample_rate)
+        self.channel_names = [f"Ch-{index + 1}" for index in range(self.raw_data.shape[0])]
+        self.loaded_source = "Demo signal"
         self.analyze_button.setEnabled(False)
         self.plot_signals(filtered=False)
 
@@ -435,12 +473,14 @@ class MainWindow(QMainWindow):
         if self.raw_data is None:
             return
 
-        filtered_channels = []
-        kernel = np.ones(10) / 10
-        for channel in self.raw_data:
-            filtered_channels.append(np.convolve(channel, kernel, mode="same"))
-
-        self.filtered_data = np.asarray(filtered_channels)
+        nyquist = self.sample_rate / 2.0
+        low_cut = 0.5
+        high_cut = min(35.0, nyquist - 1.0)
+        if high_cut <= low_cut:
+            self.filtered_data = self.raw_data.copy()
+        else:
+            b, a = butter(4, [low_cut, high_cut], btype="band", fs=self.sample_rate)
+            self.filtered_data = filtfilt(b, a, self.raw_data, axis=1)
         self.plot_signals(filtered=True)
         self.analyze_button.setEnabled(True)
         self.status_label.setText("Holat: signal filtrlandi va tahlilga tayyor.")
@@ -450,8 +490,12 @@ class MainWindow(QMainWindow):
         raw_axis = self.figure.add_subplot(2, 1, 1)
         filtered_axis = self.figure.add_subplot(2, 1, 2)
 
-        sample_rate = 250
-        times = np.linspace(0, 10, 10 * sample_rate)
+        active_data = self.raw_data if self.raw_data is not None else self.filtered_data
+        if active_data is None:
+            self.canvas.draw()
+            return
+        sample_count = active_data.shape[1]
+        times = np.arange(sample_count) / max(self.sample_rate, 1e-6)
 
         if self.raw_data is not None:
             for index, channel in enumerate(self.raw_data[:5]):
@@ -501,7 +545,7 @@ class MainWindow(QMainWindow):
 
         lines = [
             "=" * 78,
-            "NEUROANALYST PRO - KLINIK EEG TAHLILI".center(78),
+            "NEUROANALYST - KLINIK EEG TAHLILI".center(78),
             "=" * 78,
             "",
             "BEMOR MA'LUMOTLARI",

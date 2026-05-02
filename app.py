@@ -1,8 +1,11 @@
 import hashlib
+import hmac
 import io
+import json
 import os
 import sqlite3
 import tempfile
+import time
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -27,7 +30,11 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 DB_PATH = os.path.join(BASE_DIR, "clinical_platform.db")
-MODEL_VERSION = "NeuroAI Clinical Heuristic v2.1"
+NORMATIVE_DB_PATH = os.path.join(BASE_DIR, "data", "qeeg_norms.json")
+MODEL_VERSION = "NeuroAI Clinical Heuristic v2.2"
+AUTH_QUERY_PARAM = "auth"
+AUTH_SESSION_TTL_SECONDS = 12 * 60 * 60
+_NORMATIVE_DB_CACHE = None
 BANDS = {
     "Delta": (0.5, 4.0),
     "Theta": (4.0, 8.0),
@@ -65,7 +72,7 @@ DEMO_CHANNELS = [
 ]
 
 st.set_page_config(
-    page_title="NeuroAI EEG Analyzer",
+    page_title="NeuroAnalyst",
     page_icon="N",
     layout="wide",
 )
@@ -93,6 +100,80 @@ def init_session_state():
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+
+
+def get_auth_secret():
+    return os.environ.get("NEUROANALYST_AUTH_SECRET", f"{MODEL_VERSION}:{DB_PATH}")
+
+
+def build_auth_token(username):
+    expires_at = int(time.time()) + AUTH_SESSION_TTL_SECONDS
+    payload = f"{username}:{expires_at}"
+    signature = hmac.new(get_auth_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{username}:{expires_at}:{signature}"
+
+
+def verify_auth_token(token):
+    if not token:
+        return None
+
+    try:
+        username, expires_at_text, signature = str(token).split(":", 2)
+        expires_at = int(expires_at_text)
+    except (TypeError, ValueError):
+        return None
+
+    payload = f"{username}:{expires_at}"
+    expected_signature = hmac.new(
+        get_auth_secret().encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected_signature):
+        return None
+    if expires_at < int(time.time()):
+        return None
+    return username if username in DEMO_USERS else None
+
+
+def persist_login(username):
+    st.query_params[AUTH_QUERY_PARAM] = build_auth_token(username)
+
+
+def clear_persisted_login():
+    if AUTH_QUERY_PARAM in st.query_params:
+        del st.query_params[AUTH_QUERY_PARAM]
+
+
+def apply_authenticated_user(username):
+    user = DEMO_USERS[username]
+    st.session_state.authenticated = True
+    st.session_state.user = {
+        "username": username,
+        "role": user["role"],
+        "name": user["name"],
+    }
+
+
+def reset_auth_state():
+    st.session_state.authenticated = False
+    st.session_state.user = None
+
+
+def restore_login_from_query_params():
+    if st.session_state.get("authenticated"):
+        return True
+
+    token = st.query_params.get(AUTH_QUERY_PARAM)
+    username = verify_auth_token(token)
+    if not username:
+        if token:
+            clear_persisted_login()
+        reset_auth_state()
+        return False
+
+    apply_authenticated_user(username)
+    return True
 
 
 def get_connection():
@@ -288,25 +369,107 @@ def inject_styles():
     st.markdown(
         """
         <style>
+            :root {
+                --na-page: #07111f;
+                --na-surface: #10233a;
+                --na-surface-strong: #142b44;
+                --na-border: rgba(100, 255, 218, 0.16);
+                --na-text: #f8fafc;
+                --na-muted: #cbd5e1;
+                --na-soft: #94a3b8;
+                --na-accent: #22d3ee;
+                --na-accent-soft: rgba(34, 211, 238, 0.18);
+                --na-success: #64ffda;
+                --na-note-bg: linear-gradient(90deg, rgba(8, 47, 73, 0.88), rgba(15, 118, 110, 0.58));
+                --na-shadow: 0 22px 70px rgba(2, 6, 23, 0.34);
+                --na-input-bg: #0d1b2d;
+                --na-input-text: #f8fafc;
+            }
             .block-container {
                 padding-top: 1rem;
                 padding-bottom: 2rem;
             }
-            [data-testid="stSidebar"] {
+            .stApp {
                 background:
-                    linear-gradient(180deg, #0f1c2f 0%, #14263f 100%);
-                border-right: 1px solid rgba(125, 211, 252, 0.18);
+                    radial-gradient(circle at 12% 12%, rgba(34, 211, 238, 0.12), transparent 20%),
+                    radial-gradient(circle at 82% 8%, rgba(100, 255, 218, 0.10), transparent 18%),
+                    linear-gradient(180deg, #08101c 0%, #0a1627 100%);
+            }
+            [data-testid="stSidebar"] {
+                background: linear-gradient(180deg, #0e1d31 0%, #13253d 100%);
+                border-right: 1px solid var(--na-border);
+            }
+            [data-testid="stSidebar"] * {
+                color: var(--na-text) !important;
+            }
+            [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+            [data-testid="stSidebar"] label,
+            [data-testid="stSidebar"] .stRadio label,
+            [data-testid="stSidebar"] .stCheckbox label,
+            [data-testid="stSidebar"] .stSelectbox label,
+            [data-testid="stSidebar"] .stNumberInput label,
+            [data-testid="stSidebar"] .stTextInput label,
+            [data-testid="stSidebar"] .stSlider label,
+            [data-testid="stSidebar"] .stFileUploader label,
+            [data-testid="stSidebar"] h1,
+            [data-testid="stSidebar"] h2,
+            [data-testid="stSidebar"] h3 {
+                color: var(--na-text) !important;
+            }
+            [data-testid="stSidebar"] [data-baseweb="input"] input,
+            [data-testid="stSidebar"] [data-baseweb="base-input"] input,
+            [data-testid="stSidebar"] textarea,
+            [data-testid="stSidebar"] [data-baseweb="select"] > div,
+            [data-testid="stSidebar"] [data-baseweb="select"] input {
+                background: var(--na-input-bg) !important;
+                color: var(--na-input-text) !important;
+                -webkit-text-fill-color: var(--na-input-text) !important;
+                border: 1px solid var(--na-border) !important;
+                box-shadow: none !important;
+                border-radius: 0.75rem !important;
+            }
+            [data-testid="stSidebar"] input::placeholder,
+            [data-testid="stSidebar"] textarea::placeholder {
+                color: var(--na-soft) !important;
+                -webkit-text-fill-color: var(--na-soft) !important;
+                opacity: 1;
+            }
+            [data-testid="stSidebar"] [data-baseweb="radio"] div,
+            [data-testid="stSidebar"] [data-baseweb="checkbox"] div,
+            [data-testid="stSidebar"] [data-testid="stTickBar"] *,
+            [data-testid="stSidebar"] [data-testid="stSliderThumbValue"] {
+                color: var(--na-text) !important;
+            }
+            [data-testid="stSidebar"] [data-baseweb="slider"] > div > div {
+                background: rgba(203, 213, 225, 0.15);
+            }
+            [data-testid="stSidebar"] [data-baseweb="slider"] [role="slider"] {
+                background-color: var(--na-accent) !important;
+            }
+            [data-testid="stSidebar"] .stButton > button {
+                background: var(--na-accent);
+                color: #082032 !important;
+                border: 1px solid rgba(34, 211, 238, 0.22);
+                border-radius: 0.7rem;
+                font-weight: 700;
+            }
+            [data-testid="stSidebar"] .stButton > button:hover {
+                background: #64ffda;
+                color: #082032 !important;
             }
             .hero-shell {
+                position: relative;
+                overflow: hidden;
                 background:
-                    radial-gradient(circle at 15% 10%, rgba(56, 189, 248, 0.18), transparent 28%),
-                    radial-gradient(circle at 85% 15%, rgba(16, 185, 129, 0.14), transparent 24%),
-                    linear-gradient(140deg, #0b1220 0%, #132238 56%, #10283a 100%);
-                border: 1px solid rgba(148, 163, 184, 0.16);
+                    linear-gradient(135deg, rgba(4, 19, 34, 0.88), rgba(5, 48, 74, 0.52)),
+                    url("data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 320'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0%25' stop-color='%230ea5e9' stop-opacity='0.85'/%3E%3Cstop offset='100%25' stop-color='%2322d3ee' stop-opacity='0.95'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='1200' height='320' fill='%23061a2f'/%3E%3Ccircle cx='1040' cy='78' r='110' fill='url(%23g)' opacity='0.18'/%3E%3Ccircle cx='880' cy='176' r='126' fill='url(%23g)' opacity='0.16'/%3E%3Cg stroke='%230ea5e9' stroke-opacity='0.18'%3E%3Cpath d='M0 270H1200'/%3E%3Cpath d='M0 296H1200'/%3E%3Cpath d='M36 0V320'/%3E%3Cpath d='M128 0V320'/%3E%3Cpath d='M228 0V320'/%3E%3Cpath d='M980 0V320'/%3E%3C/g%3E%3Cg fill='%2322d3ee' fill-opacity='0.25'%3E%3Ccircle cx='120' cy='42' r='5'/%3E%3Ccircle cx='168' cy='68' r='4'/%3E%3Ccircle cx='210' cy='118' r='5'/%3E%3Ccircle cx='1020' cy='232' r='6'/%3E%3Ccircle cx='918' cy='248' r='4'/%3E%3Ccircle cx='1092' cy='206' r='5'/%3E%3C/g%3E%3Cg fill='none' stroke='url(%23g)' stroke-width='3' stroke-opacity='0.6'%3E%3Cpath d='M734 70c30-38 82-44 120-26 18-26 53-36 87-26 28 8 50 32 58 60 27 14 41 40 42 68 1 33-17 63-45 80-5 34-31 64-64 74-25 7-52 4-74-9-21 19-50 28-78 24-40-6-75-34-88-72-35-17-57-51-57-90 0-36 18-67 49-83 1-34 20-65 50-82z'/%3E%3Cpath d='M770 110c22 12 28 44 12 64-15 19-14 50 3 68'/%3E%3Cpath d='M830 100c22 18 31 50 24 77'/%3E%3Cpath d='M890 92c18 24 24 60 14 90'/%3E%3Cpath d='M944 112c15 16 23 40 23 63'/%3E%3Cpath d='M770 190c18 13 34 31 44 52'/%3E%3Cpath d='M840 202c11 22 16 42 18 63'/%3E%3Cpath d='M908 194c2 24-1 46-10 66'/%3E%3C/g%3E%3Cg stroke='%2364ffda' stroke-opacity='0.35'%3E%3Cpath d='M764 98l64 18 56-20 62 34 8 55-44 20-52-4-30 34-58-14-26-56z'/%3E%3C/g%3E%3C/svg%3E");
+                background-size: cover;
+                background-position: center;
+                border: 1px solid var(--na-border);
                 border-radius: 26px;
                 padding: 28px 32px;
                 margin-bottom: 1rem;
-                box-shadow: 0 20px 60px rgba(2, 6, 23, 0.28);
+                box-shadow: var(--na-shadow);
             }
             .hero-title {
                 color: #f8fafc;
@@ -314,18 +477,20 @@ def inject_styles():
                 font-weight: 800;
                 letter-spacing: -0.02em;
                 margin-bottom: 0.2rem;
+                text-shadow: 0 4px 24px rgba(8, 23, 38, 0.35);
             }
             .hero-subtitle {
-                color: #cbd5e1;
+                color: #dbeafe;
                 font-size: 1rem;
                 max-width: 70rem;
             }
             .glass-card {
-                background: linear-gradient(180deg, rgba(15, 23, 42, 0.88), rgba(17, 24, 39, 0.94));
-                border: 1px solid rgba(56, 189, 248, 0.18);
+                background: linear-gradient(180deg, rgba(16, 35, 58, 0.94), rgba(20, 43, 68, 0.94));
+                border: 1px solid var(--na-border);
                 border-radius: 18px;
                 padding: 14px 16px;
                 margin-bottom: 0.8rem;
+                box-shadow: var(--na-shadow);
             }
             .glass-label {
                 color: #94a3b8;
@@ -352,8 +517,8 @@ def inject_styles():
                 margin-bottom: 0.6rem;
             }
             .clinical-note {
-                background: linear-gradient(90deg, rgba(6, 78, 59, 0.75), rgba(15, 118, 110, 0.55));
-                border: 1px solid rgba(45, 212, 191, 0.2);
+                background: var(--na-note-bg);
+                border: 1px solid var(--na-border);
                 border-radius: 18px;
                 padding: 14px 16px;
                 color: #ecfeff;
@@ -377,8 +542,37 @@ def render_metric_card(label, value):
     )
 
 
+def style_axes(axis):
+    face = "#ffffff"
+    text = "#0f172a"
+    grid = "#cbd5e1"
+    axis.set_facecolor(face)
+    axis.tick_params(colors=text)
+    axis.xaxis.label.set_color(text)
+    axis.yaxis.label.set_color(text)
+    axis.title.set_color(text)
+    for spine in axis.spines.values():
+        spine.set_color(grid)
+    axis.grid(color=grid, alpha=0.35)
+
+
+def style_figure(figure):
+    figure.patch.set_facecolor("#ffffff")
+
+
 def check_password():
+    restore_login_from_query_params()
+
     if st.session_state.get("authenticated"):
+        user = st.session_state.get("user") or {}
+        display_name = user.get("name") or "Noma'lum"
+        st.sidebar.success(f"Kirgan foydalanuvchi: {display_name}")
+        if st.sidebar.button("Chiqish", use_container_width=True):
+            username = user.get("username", "unknown")
+            clear_persisted_login()
+            reset_auth_state()
+            log_audit("logout", f"user={username}")
+            st.rerun()
         return True
 
     st.sidebar.header("Kirish")
@@ -389,12 +583,8 @@ def check_password():
         user = DEMO_USERS.get(username)
         password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
         if user and password_hash == user["password_hash"]:
-            st.session_state.authenticated = True
-            st.session_state.user = {
-                "username": username,
-                "role": user["role"],
-                "name": user["name"],
-            }
+            apply_authenticated_user(username)
+            persist_login(username)
             log_audit("login", f"user={username}")
             st.rerun()
         st.sidebar.error("Login yoki parol xato.")
@@ -475,8 +665,17 @@ def load_edf_recording(uploaded_file):
         temp_path = temp_file.name
 
     try:
-        raw = mne.io.read_raw_edf(temp_path, preload=True, verbose="ERROR")
+        reader = mne.io.read_raw_bdf if suffix == ".bdf" else mne.io.read_raw_edf
+        raw = reader(temp_path, preload=True, verbose="ERROR")
+        try:
+            eeg_picks = mne.pick_types(raw.info, eeg=True, exclude=[])
+            if len(eeg_picks):
+                raw.pick(eeg_picks)
+        except Exception:
+            pass
         data = raw.get_data() * 1e6
+        if data.size == 0:
+            raise RuntimeError("Yuklangan faylda EEG kanal topilmadi.")
         return {
             "data": normalize_orientation(data),
             "sfreq": float(raw.info["sfreq"]),
@@ -585,38 +784,286 @@ def compute_quality_metrics(data, sfreq, notch_hz):
     }
 
 
+def load_normative_database():
+    global _NORMATIVE_DB_CACHE
+    if _NORMATIVE_DB_CACHE is None:
+        with open(NORMATIVE_DB_PATH, "r", encoding="utf-8") as handle:
+            _NORMATIVE_DB_CACHE = json.load(handle)
+    return _NORMATIVE_DB_CACHE
+
+
+def normalize_gender_key(gender):
+    value = str(gender or "").strip().lower()
+    if value in {"erkak", "male", "m"}:
+        return "male"
+    if value in {"ayol", "female", "f"}:
+        return "female"
+    return "any"
+
+
+def select_normative_profile(age, gender):
+    database = load_normative_database()
+    normalized_gender = normalize_gender_key(gender)
+    profiles = database.get("profiles", [])
+
+    in_range = [
+        profile
+        for profile in profiles
+        if float(profile["age_min"]) <= float(age) <= float(profile["age_max"])
+    ]
+    if not in_range:
+        in_range = profiles
+
+    for preferred_sex in (normalized_gender, "any"):
+        for profile in in_range:
+            if profile.get("sex") == preferred_sex:
+                return profile, database.get("metadata", {})
+
+    if in_range:
+        return in_range[0], database.get("metadata", {})
+    return None, database.get("metadata", {})
+
+
+def classify_zscore(z_score):
+    absolute_value = abs(float(z_score))
+    if absolute_value >= 2.0:
+        return "abnormal"
+    if absolute_value >= 1.5:
+        return "borderline"
+    return "normal"
+
+
+def build_normative_assessment(patient, band_means, dominant_frequency, slowing_index):
+    profile, metadata = select_normative_profile(patient["age"], patient["gender"])
+    if profile is None:
+        return {
+            "available": False,
+            "overall_status": "Normativ profil topilmadi",
+            "headline": "Yosh/jins bo'yicha normativ profil mavjud emas.",
+            "rows": [],
+            "profile_label": "Topilmadi",
+            "reference_name": metadata.get("name", "Noma'lum"),
+            "reference_note": metadata.get("notes", ""),
+            "abnormal_feature_count": 0,
+            "borderline_feature_count": 0,
+            "deviation_index": 0.0,
+            "slowing_status": "unknown",
+            "dominant_frequency_status": "unknown",
+        }
+
+    rows = []
+    abnormal_feature_count = 0
+    borderline_feature_count = 0
+    top_deviations = []
+
+    for band_name in BANDS:
+        reference = profile["bands"][band_name]
+        mean = float(reference["mean"])
+        std = max(float(reference["std"]), 1e-6)
+        value = float(band_means[band_name])
+        z_score = (value - mean) / std
+        status = classify_zscore(z_score)
+        rows.append(
+            {
+                "feature": band_name,
+                "value": value,
+                "expected": f"{mean:.1f} +/- {std:.1f}",
+                "z_score": z_score,
+                "status": status,
+            }
+        )
+        if status == "abnormal":
+            abnormal_feature_count += 1
+        elif status == "borderline":
+            borderline_feature_count += 1
+        top_deviations.append((abs(z_score), band_name))
+
+    dominant_reference = profile["dominant_frequency"]
+    dominant_mean = float(dominant_reference["mean"])
+    dominant_std = max(float(dominant_reference["std"]), 1e-6)
+    dominant_z = (float(dominant_frequency) - dominant_mean) / dominant_std
+    dominant_status = classify_zscore(dominant_z)
+    if float(dominant_frequency) < float(dominant_reference["min"]) or float(dominant_frequency) > float(dominant_reference["max"]):
+        dominant_status = "abnormal"
+    rows.append(
+        {
+            "feature": "Dominant frequency",
+            "value": float(dominant_frequency),
+            "expected": f"{float(dominant_reference['min']):.1f}-{float(dominant_reference['max']):.1f} Hz",
+            "z_score": dominant_z,
+            "status": dominant_status,
+        }
+    )
+    if dominant_status == "abnormal":
+        abnormal_feature_count += 1
+    elif dominant_status == "borderline":
+        borderline_feature_count += 1
+    top_deviations.append((abs(dominant_z), "Dominant frequency"))
+
+    slowing_reference = profile["slowing_index"]
+    slowing_mean = float(slowing_reference["mean"])
+    slowing_std = max(float(slowing_reference["std"]), 1e-6)
+    slowing_z = (float(slowing_index) - slowing_mean) / slowing_std
+    slowing_status = "normal"
+    if float(slowing_index) > float(slowing_reference["max_normal"]):
+        slowing_status = "abnormal"
+    elif slowing_z >= 1.5:
+        slowing_status = "borderline"
+    rows.append(
+        {
+            "feature": "Slowing index",
+            "value": float(slowing_index),
+            "expected": f"<= {float(slowing_reference['max_normal']):.2f}",
+            "z_score": slowing_z,
+            "status": slowing_status,
+        }
+    )
+    if slowing_status == "abnormal":
+        abnormal_feature_count += 1
+    elif slowing_status == "borderline":
+        borderline_feature_count += 1
+    top_deviations.append((abs(slowing_z), "Slowing index"))
+
+    if abnormal_feature_count >= 2 or (slowing_status == "abnormal" and dominant_status != "normal"):
+        overall_status = "Sezilarli normativ og'ish"
+    elif abnormal_feature_count == 1 or borderline_feature_count >= 2:
+        overall_status = "Chegaraviy normativ og'ish"
+    else:
+        overall_status = "Normaga mos"
+
+    top_names = [name for _, name in sorted(top_deviations, reverse=True)[:3]]
+    if overall_status == "Normaga mos":
+        headline = "Yosh va jins profili bilan asosiy ko'rsatkichlar mos."
+    else:
+        headline = "Asosiy og'ishlar: " + ", ".join(top_names) + "."
+
+    max_abs_z = max((abs(row["z_score"]) for row in rows), default=0.0)
+    deviation_index = float(
+        np.clip(max_abs_z * 22.0 + abnormal_feature_count * 12.0 + borderline_feature_count * 5.0, 0.0, 100.0)
+    )
+
+    return {
+        "available": True,
+        "overall_status": overall_status,
+        "headline": headline,
+        "rows": rows,
+        "profile_label": profile["label"],
+        "profile_id": profile["id"],
+        "reference_name": metadata.get("name", "Noma'lum"),
+        "reference_note": metadata.get("notes", ""),
+        "abnormal_feature_count": abnormal_feature_count,
+        "borderline_feature_count": borderline_feature_count,
+        "deviation_index": deviation_index,
+        "slowing_status": slowing_status,
+        "dominant_frequency_status": dominant_status,
+    }
+
+
+def robust_zscore(values, axis=0):
+    median = np.median(values, axis=axis, keepdims=True)
+    mad = np.median(np.abs(values - median), axis=axis, keepdims=True) + 1e-6
+    return 0.6745 * (values - median) / mad
+
+
 def detect_events(data, sfreq):
-    window_sec = 2.0
-    step_sec = 0.5
+    window_sec = 1.0
+    step_sec = 0.25
     window_size = max(int(window_sec * sfreq), 16)
     step_size = max(int(step_sec * sfreq), 1)
-    events = []
+    if data.shape[1] < window_size:
+        return []
+
+    starts = []
+    peak_windows = []
+    line_windows = []
+    slope_windows = []
 
     for start in range(0, data.shape[1] - window_size + 1, step_size):
         end = start + window_size
         chunk = data[:, start:end]
-        peak_to_peak = np.ptp(chunk, axis=1)
-        line_length = np.mean(np.abs(np.diff(chunk, axis=1)), axis=1)
-        high_slope = np.max(np.abs(np.diff(chunk, axis=1)), axis=1)
-        event_score = peak_to_peak * 0.22 + line_length * 1.8 + high_slope * 0.07
-        channel_index = int(np.argmax(event_score))
-        events.append(
-            {
-                "start": start / sfreq,
-                "end": end / sfreq,
-                "score": float(np.max(event_score)),
-                "channel_index": channel_index,
-                "peak_to_peak": float(peak_to_peak[channel_index]),
-                "line_length": float(line_length[channel_index]),
-            }
-        )
+        starts.append(start)
+        peak_windows.append(np.ptp(chunk, axis=1))
+        line_windows.append(np.mean(np.abs(np.diff(chunk, axis=1)), axis=1))
+        slope_windows.append(np.max(np.abs(np.diff(chunk, axis=1)), axis=1))
 
-    if not events:
+    peak_windows = np.asarray(peak_windows, dtype=float)
+    line_windows = np.asarray(line_windows, dtype=float)
+    slope_windows = np.asarray(slope_windows, dtype=float)
+    if peak_windows.size == 0:
         return []
 
-    scores = np.asarray([event["score"] for event in events], dtype=float)
-    threshold = float(np.percentile(scores, 93))
-    return [event for event in events if event["score"] >= threshold]
+    peak_z = np.clip(robust_zscore(peak_windows, axis=0), 0.0, None)
+    line_z = np.clip(robust_zscore(line_windows, axis=0), 0.0, None)
+    slope_z = np.clip(robust_zscore(slope_windows, axis=0), 0.0, None)
+    composite = peak_z * 0.5 + line_z * 0.3 + slope_z * 0.2
+
+    dominant_channels = np.argmax(composite, axis=1)
+    row_indices = np.arange(composite.shape[0])
+    dominant_scores = composite[row_indices, dominant_channels]
+    dominant_peaks = peak_z[row_indices, dominant_channels]
+    dominant_lines = line_z[row_indices, dominant_channels]
+    dominant_slopes = slope_z[row_indices, dominant_channels]
+    active_channels = np.sum(composite >= 4.5, axis=1)
+    spread_limit = max(2, int(np.ceil(data.shape[0] * 0.35)))
+
+    candidates = (
+        (dominant_scores >= 5.5)
+        & ((dominant_peaks >= 4.8) | (dominant_lines >= 5.0) | (dominant_slopes >= 5.0))
+        & (active_channels <= spread_limit)
+    )
+
+    events = []
+    active_event = None
+    for index, is_candidate in enumerate(candidates):
+        if not is_candidate:
+            if active_event is not None:
+                events.append(active_event)
+                active_event = None
+            continue
+
+        start_sec = starts[index] / sfreq
+        end_sec = (starts[index] + window_size) / sfreq
+        channel_index = int(dominant_channels[index])
+        score = float(dominant_scores[index])
+        event_payload = {
+            "start": start_sec,
+            "end": end_sec,
+            "score": score,
+            "channel_index": channel_index,
+            "peak_to_peak": float(peak_windows[index, channel_index]),
+            "line_length": float(line_windows[index, channel_index]),
+            "support_windows": 1,
+            "active_channels": int(active_channels[index]),
+        }
+
+        is_same_event = (
+            active_event is not None
+            and channel_index == active_event["channel_index"]
+            and start_sec <= active_event["end"] + step_sec
+        )
+        if is_same_event:
+            event_start = active_event["start"]
+            active_event["end"] = end_sec
+            active_event["support_windows"] += 1
+            if score > active_event["score"]:
+                active_event.update(event_payload)
+                active_event["start"] = event_start
+                active_event["end"] = end_sec
+        else:
+            if active_event is not None:
+                events.append(active_event)
+            active_event = event_payload
+
+    if active_event is not None:
+        events.append(active_event)
+
+    filtered_events = []
+    for event in events:
+        duration = event["end"] - event["start"]
+        if event["score"] >= 6.2 or event["support_windows"] >= 2 or duration >= 1.25:
+            filtered_events.append(event)
+
+    return filtered_events
 
 
 def compute_dominant_frequency(data, sfreq):
@@ -626,7 +1073,7 @@ def compute_dominant_frequency(data, sfreq):
     return float(frequencies[mask][np.argmax(avg_psd[mask])])
 
 
-def build_analysis(recording, notch_hz):
+def build_analysis(recording, notch_hz, patient):
     data = recording["data"]
     sfreq = recording["sfreq"]
     channel_names = recording["channel_names"]
@@ -635,8 +1082,10 @@ def build_analysis(recording, notch_hz):
     quality = compute_quality_metrics(data, sfreq, notch_hz)
     events = detect_events(data, sfreq)
     dominant_frequency = compute_dominant_frequency(data, sfreq)
+    duration_sec = data.shape[1] / max(sfreq, 1e-6)
 
     slowing_index = (band_means["Delta"] + band_means["Theta"]) / max(band_means["Alpha"] + band_means["Beta"], 1e-6)
+    normative = build_normative_assessment(patient, band_means, dominant_frequency, slowing_index)
     epileptiform_index = float(np.mean([event["score"] for event in events])) if events else 0.0
     dominant_channel = "Aniqlanmadi"
     if events:
@@ -645,38 +1094,93 @@ def build_analysis(recording, notch_hz):
             counts[event["channel_index"]] = counts.get(event["channel_index"], 0) + 1
         dominant_channel = channel_names[max(counts, key=counts.get)]
 
+    suspicious_channel_count = len({event["channel_index"] for event in events})
+    event_seconds = float(sum(event["end"] - event["start"] for event in events))
+    event_rate_per_min = float(len(events) / max(duration_sec / 60.0, 1e-6))
+    event_burden = float(event_seconds / max(duration_sec, 1e-6) * 100.0)
+    focality_ratio = suspicious_channel_count / max(len(channel_names), 1)
+    max_event_score = float(max((event["score"] for event in events), default=0.0))
+    normal_event_profile = (
+        len(events) == 0
+        or (
+            len(events) == 1
+            and max_event_score < 11.0
+            and (event_burden < 10.0 or duration_sec < 15.0)
+        )
+    )
+    strong_epileptiform_pattern = (
+        len(events) >= 2
+        and event_rate_per_min >= 1.5
+        and epileptiform_index >= 6.8
+        and focality_ratio <= 0.45
+        and quality["artifact_ratio"] < 18.0
+    )
+    borderline_epileptiform_pattern = (
+        (
+            (len(events) >= 2 and event_rate_per_min >= 0.8)
+            or (len(events) == 1 and max_event_score >= 11.0 and event_burden >= 8.0)
+        )
+        and epileptiform_index >= 6.0
+        and quality["artifact_ratio"] < 22.0
+    )
+    event_risk_component = 0.0 if normal_event_profile else event_rate_per_min * 9.5 + event_burden * 0.35
+    seizure_component = 0.0 if normal_event_profile else event_rate_per_min * 18.0 + max(0.0, epileptiform_index - 5.0) * 8.0 + event_burden * 0.45
+    normative_strong_deviation = normative["overall_status"] == "Sezilarli normativ og'ish"
+    normative_borderline = normative["overall_status"] == "Chegaraviy normativ og'ish"
+    normative_normal = normative["overall_status"] == "Normaga mos"
+
     if quality["signal_quality"] < 55:
         label = "Signal sifati past"
         recommendation = "Elektrod kontaktlarini va yozuv sifatini tekshirib, qayta EEG tavsiya etiladi."
         confidence = 48.0
-    elif len(events) >= 4 and epileptiform_index > 26:
+    elif strong_epileptiform_pattern:
         label = "Epileptiform faollikka kuchli shubha"
         recommendation = "Shubhali segmentlarni nevrolog tomonidan tezkor vizual verifikatsiya qilish kerak."
-        confidence = min(96.0, 72.0 + len(events) * 3.0)
-    elif slowing_index > 1.85 and band_means["Alpha"] < 18.0:
+        confidence = min(96.0, 72.0 + event_rate_per_min * 7.0 + max(0.0, epileptiform_index - 6.0) * 4.0)
+    elif normative["slowing_status"] == "abnormal" or (slowing_index > 1.85 and band_means["Alpha"] < 18.0 and dominant_frequency < 8.5):
         label = "Diffuz sekinlashuv ehtimoli"
-        recommendation = "Ensefalopatiya yoki diffuz disfunktsiya uchun klinik baholash tavsiya etiladi."
-        confidence = min(90.0, 63.0 + slowing_index * 8.0)
-    elif 8.0 <= dominant_frequency <= 12.5 and quality["artifact_ratio"] < 12.0:
+        recommendation = "Yosh va jins normasiga nisbatan sekinlashuv ko'rsatkichlari oshgan. Ensefalopatiya yoki diffuz disfunktsiya uchun klinik baholash tavsiya etiladi."
+        confidence = min(90.0, 63.0 + slowing_index * 8.0 + normative["deviation_index"] * 0.08)
+    elif 8.0 <= dominant_frequency <= 12.5 and quality["artifact_ratio"] < 12.0 and quality["signal_quality"] >= 70.0 and slowing_index < 1.45 and normal_event_profile and normative_normal:
         label = "Ehtimol normal EEG"
-        recommendation = "Vizual EEG ko'rigi bilan tasdiqlashdan so'ng yakuniy xulosa beriladi."
+        recommendation = f"Yosh va jins bo'yicha tanlangan norma profili ({normative['profile_label']}) bilan mos. Vizual EEG ko'rigi bilan tasdiqlashdan so'ng yakuniy xulosa beriladi."
         confidence = max(76.0, 94.0 - quality["artifact_ratio"] * 0.9)
+    elif borderline_epileptiform_pattern:
+        label = "Epileptiform faollikka shubha"
+        recommendation = "Shubhali segmentlarni qo'lda EEG ko'rigi va klinik kontekst bilan solishtirish tavsiya etiladi."
+        confidence = min(88.0, 66.0 + event_rate_per_min * 5.5 + max(0.0, epileptiform_index - 5.5) * 3.2)
+    elif normative_strong_deviation:
+        label = "Normativdan og'ish bor"
+        recommendation = f"Yosh va jins bo'yicha normativ qiyosda sezilarli og'ish topildi. {normative['headline']} Qo'lda EEG ko'rigi va klinik kontekst bilan tekshirish tavsiya etiladi."
+        confidence = min(86.0, 64.0 + normative["deviation_index"] * 0.18)
+    elif normative_borderline:
+        label = "Chegaraviy topilmalar"
+        recommendation = f"Yosh va jins normasiga nisbatan yengil yoki o'rtacha og'ish bor. {normative['headline']} Qo'shimcha klinik kontekst tavsiya etiladi."
+        confidence = max(67.0, min(82.0, 62.0 + normative["deviation_index"] * 0.14))
     else:
         label = "Chegaraviy topilmalar"
         recommendation = "Qo'shimcha klinik kontekst va qo'lda EEG ko'rigi tavsiya etiladi."
         confidence = 67.0
 
+    normative_risk_component = 0.0 if normative_normal else normative["deviation_index"] * 0.18
     risk_score = float(
         np.clip(
             confidence * 0.52
-            + len(events) * 7.5
+            + event_risk_component
             + slowing_index * 10.0
+            + normative_risk_component
             + max(0.0, 70.0 - quality["signal_quality"]) * 0.35,
             0.0,
             100.0,
         )
     )
-    seizure_probability = float(np.clip(len(events) * 11.0 + epileptiform_index * 0.55, 0.0, 100.0))
+    seizure_probability = float(
+        np.clip(
+            seizure_component,
+            0.0,
+            100.0,
+        )
+    )
 
     return {
         "label": label,
@@ -695,6 +1199,10 @@ def build_analysis(recording, notch_hz):
         "dominant_channel": dominant_channel,
         "slowing_index": float(slowing_index),
         "epileptiform_index": epileptiform_index,
+        "event_rate_per_min": event_rate_per_min,
+        "event_burden": event_burden,
+        "suspicious_channel_count": suspicious_channel_count,
+        "normative": normative,
         "risk_score": risk_score,
         "seizure_probability": seizure_probability,
     }
@@ -720,7 +1228,7 @@ def plot_signal_review(raw_recording, clean_recording, events, window_start_sec=
         for index in range(n_channels):
             offset = (n_channels - index) * 4.0
             axis.plot(times, centered[index] / scales[index] + offset, linewidth=0.9, color=color, alpha=0.85)
-            axis.text(times[-1] + 0.1, offset, recording["channel_names"][index], fontsize=8, color="#cbd5e1")
+            axis.text(times[-1] + 0.1, offset, recording["channel_names"][index], fontsize=8, color="#0f172a")
 
         for event in events:
             overlap_start = max(event["start"], window_start_sec)
@@ -730,9 +1238,10 @@ def plot_signal_review(raw_recording, clean_recording, events, window_start_sec=
 
         axis.set_title(title)
         axis.set_ylabel("Norm + offset")
-        axis.grid(alpha=0.18)
+        style_axes(axis)
 
     axes[1].set_xlabel("Vaqt (sekund)")
+    style_figure(figure)
     figure.tight_layout()
     return figure
 
@@ -746,7 +1255,11 @@ def plot_band_heatmap(band_table):
     axis.set_xticks(range(len(BANDS)))
     axis.set_xticklabels(list(BANDS.keys()))
     axis.set_title("Kanal bo'yicha ritm ulushlari (%)")
-    figure.colorbar(heatmap, ax=axis, shrink=0.88)
+    style_axes(axis)
+    colorbar = figure.colorbar(heatmap, ax=axis, shrink=0.88)
+    colorbar.ax.yaxis.label.set_color("#0f172a")
+    colorbar.ax.tick_params(colors="#0f172a")
+    style_figure(figure)
     figure.tight_layout()
     return figure
 
@@ -765,7 +1278,8 @@ def plot_event_timeline(events, total_duration=None, window_start_sec=0.0, windo
     axis.axvspan(window_start_sec, window_start_sec + window_duration_sec, color="#38bdf8", alpha=0.14)
     axis.set_xlabel("Vaqt (sekund)")
     axis.set_title("Patologik segment timeline")
-    axis.grid(alpha=0.18)
+    style_axes(axis)
+    style_figure(figure)
     figure.tight_layout()
     return figure
 
@@ -786,7 +1300,11 @@ def plot_spectrogram(clean_recording, channel_index=0, window_start_sec=0.0, win
     axis.set_title(f"Spektrogramma: {clean_recording['channel_names'][channel_index]} ({window_start_sec:.1f}-{window_start_sec + window_duration_sec:.1f}s)")
     axis.set_ylabel("Hz")
     axis.set_xlabel("Vaqt (sekund)")
-    figure.colorbar(image, ax=axis, label="dB")
+    style_axes(axis)
+    colorbar = figure.colorbar(image, ax=axis, label="dB")
+    colorbar.ax.yaxis.label.set_color("#0f172a")
+    colorbar.ax.tick_params(colors="#0f172a")
+    style_figure(figure)
     figure.tight_layout()
     return figure
 
@@ -802,7 +1320,7 @@ def build_report_text(patient, recording, analysis):
         event_lines.append("Shubhali segment aniqlanmadi.")
 
     lines = [
-        "NEUROAI EEG ANALYZER - CLINICAL DECISION SUPPORT REPORT",
+        "NEUROANALYST - CLINICAL DECISION SUPPORT REPORT",
         "=" * 64,
         f"Hisobot vaqti: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
@@ -833,12 +1351,26 @@ def build_report_text(patient, recording, analysis):
         f"Dominant chastota: {analysis['dominant_frequency']:.2f} Hz",
         f"Dominant kanal: {analysis['dominant_channel']}",
         f"Slowing index: {analysis['slowing_index']:.2f}",
+        f"Shubhali event rate: {analysis['event_rate_per_min']:.2f} / min",
+        f"Event burden: {analysis['event_burden']:.1f}%",
+        "",
+        "NORMATIV QIYOS",
+        f"Profil: {analysis['normative']['profile_label']}",
+        f"Holat: {analysis['normative']['overall_status']}",
+        f"Izoh: {analysis['normative']['headline']}",
         "",
         "RITM ULUSHLARI (%)",
     ]
 
     for band_name in BANDS:
         lines.append(f"{band_name}: {analysis['band_means'][band_name]:.1f}")
+
+    lines.append("")
+    lines.append("YOSH/JINS NORMASI BO'YICHA KO'RSATKICHLAR")
+    for row in analysis["normative"]["rows"][:7]:
+        lines.append(
+            f"{row['feature']}: {row['value']:.2f} | kutilgan {row['expected']} | z={row['z_score']:.2f} | {row['status']}"
+        )
 
     lines.extend(["", "SHUBHALI SEGMENTLAR", *event_lines, "", "TAVSIYA", analysis["recommendation"], ""])
     lines.extend(
@@ -881,7 +1413,7 @@ def build_report_pdf(patient, recording, analysis, report_text):
     )
 
     story = [
-        Paragraph("NeuroAI EEG Analyzer - Clinical Report", title_style),
+        Paragraph("NeuroAnalyst - Clinical Report", title_style),
         Paragraph(f"Yaratilgan vaqt: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", body_style),
         Spacer(1, 8),
         Paragraph("Bemor ma'lumotlari", section_style),
@@ -917,6 +1449,8 @@ def build_report_pdf(patient, recording, analysis, report_text):
             ["Artefakt", f"{analysis['artifact_ratio']:.1f}%"],
             ["Seizure risk score", f"{analysis['risk_score']:.1f}/100"],
             ["Dominant kanal", analysis["dominant_channel"]],
+            ["Normativ profil", analysis["normative"]["profile_label"]],
+            ["Normativ holat", analysis["normative"]["overall_status"]],
         ],
         colWidths=[140, 314],
     )
@@ -963,7 +1497,7 @@ def main():
     st.markdown(
         f"""
         <div class="hero-shell">
-            <div class="hero-title">NeuroAI EEG Analyzer</div>
+            <div class="hero-title">NeuroAnalyst</div>
             <div class="hero-subtitle">
                 EEG signallarini avtomatik qayta ishlash, patologik segmentlarni belgilash,
                 risk score va klinik xulosa yaratish uchun mo'ljallangan kengaytirilgan
@@ -1104,7 +1638,7 @@ def main():
 
     if st.button("Klinik tahlilni ishga tushirish", type="primary", use_container_width=True):
         clean_recording = preprocess_recording(raw_recording, low_cut, high_cut, notch_hz, apply_notch)
-        analysis = build_analysis(clean_recording, notch_hz)
+        analysis = build_analysis(clean_recording, notch_hz, patient)
         report_text = build_report_text(patient, clean_recording, analysis)
         report_pdf = build_report_pdf(patient, clean_recording, analysis, report_text)
         patient_db_id = save_patient(patient)
@@ -1124,7 +1658,7 @@ def main():
         st.warning("Signal tayyor. Klinik tahlilni ishga tushirish tugmasini bosing.")
         return
 
-    summary1, summary2, summary3, summary4 = st.columns(4)
+    summary1, summary2, summary3, summary4, summary5 = st.columns(5)
     with summary1:
         st.metric("AI yorlig'i", analysis["label"])
     with summary2:
@@ -1133,6 +1667,8 @@ def main():
         st.metric("Signal sifati", f"{analysis['signal_quality']:.1f}%")
     with summary4:
         st.metric("Seizure risk", f"{analysis['risk_score']:.1f}/100")
+    with summary5:
+        st.metric("Normativ qiyos", analysis["normative"]["overall_status"])
 
     dashboard_tab, signal_tab, ai_tab, registry_tab, admin_tab = st.tabs(
         ["Dashboard", "Signal Review", "AI Findings", "Patient Registry", "Reports & Admin"]
@@ -1152,6 +1688,7 @@ def main():
         with right:
             render_metric_card("Shubhali segmentlar", str(len(analysis["events"])))
             render_metric_card("Dominant kanal", analysis["dominant_channel"])
+            render_metric_card("Normativ profil", analysis["normative"]["profile_label"])
             render_metric_card("So'nggi study ID", str(st.session_state.last_saved_study_id or "-"))
 
         st.info(analysis["recommendation"])
@@ -1262,7 +1799,15 @@ def main():
             st.write(f"Dominant kanal: **{analysis['dominant_channel']}**")
             st.write(f"Slowing index: **{analysis['slowing_index']:.2f}**")
             st.write(f"Epileptiform index: **{analysis['epileptiform_index']:.1f}**")
+            st.write(f"Normativ profil: **{analysis['normative']['profile_label']}**")
+            st.write(f"Normativ holat: **{analysis['normative']['overall_status']}**")
+            st.write(f"Normativ izoh: **{analysis['normative']['headline']}**")
             st.write(f"Tavsiya: **{analysis['recommendation']}**")
+            st.markdown("### Yosh va jins normasi bilan qiyos")
+            normative_df = pd.DataFrame(analysis["normative"]["rows"])
+            normative_df["value"] = normative_df["value"].map(lambda value: round(float(value), 2))
+            normative_df["z_score"] = normative_df["z_score"].map(lambda value: round(float(value), 2))
+            st.dataframe(normative_df, use_container_width=True, hide_index=True)
             st.markdown("### Segment markerlari")
             if analysis["events"]:
                 for event in analysis["events"][:8]:

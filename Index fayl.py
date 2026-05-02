@@ -8,6 +8,6 @@ os.makedirs('icons', exist_ok=True)
 
 # Oddiy logotip fayli yaratish
 with open('icons/logo.txt', 'w') as f:
-    f.write('NeuroAnalyst Pro - EEG Tahlil Platformasi')
+    f.write('NeuroAnalyst - EEG Tahlil Platformasi')
 
 print("✅ icons papkasi va logo.txt yaratildi!")
