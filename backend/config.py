@@ -87,6 +87,12 @@ class Settings(BaseSettings):
     encrypt_eeg_files: bool = True
     encrypted_data_dir: str = str(BASE_DIR / "data" / "encrypted_eeg")
 
+    # ── HIS/EMR Integratsiya ─────────────────────────────────────────
+    his_enabled: bool = False
+    his_type: str = "rest"  # hl7, fhir, rest
+    his_base_url: str = "http://his.hospital.local:8080"
+    his_api_key: str = "your_his_api_key_here"
+
     @property
     def aes_key_bytes(self) -> bytes:
         """AES key'ni hex stringdan bytes'ga o'tkazadi."""

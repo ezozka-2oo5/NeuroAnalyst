@@ -33,7 +33,6 @@ ENV/
 env.bak/
 venv.bak/
 
-Deploy.md
 # ==========================================
 # Maxfiy ma'lumotlar va Konfiguratsiya
 # ==========================================
@@ -41,23 +40,32 @@ Deploy.md
 .env.local
 .env.production
 .env.development
+*.env
 
 # ==========================================
 # Loyihaga oid fayllar (Ma'lumotlar bazasi va Datasetlar)
 # ==========================================
 # Ma'lumotlar bazasi
-clinical_platform.db
-clinical_platform.db-journal
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+clinical_platform.db*
 users.json
+users_backup.json
 
-# Datasetlar va fayllar
+# Datasetlar va fayllar (katta fayllar GitHub'ga yuklanmasin)
 data/*.edf
 data/*.set
 data/*.csv
 data/*.bdf
+data/*.fdt
+data/*.fif
 data/raw/
+data/raw_data/
 data/processed/
 data/temp/
+data/encrypted_eeg/
 
 # Model og'irliklari (Katta fayllar)
 ml_pipeline/demo_output/checkpoints/*.pt
@@ -68,8 +76,40 @@ ml_pipeline/real_output/checkpoints/*.onnx
 # Loglar va Keshlar
 logs/
 *.log
+*.out.log
+*.err.log
+streamlit.log
+streamlit.out.log
+streamlit.err.log
 .mplconfig/
 .pytest_cache/
+
+# Video va Media fayllar (katta hajmli)
+*.mp4
+*.avi
+*.mov
+background.mp4
+
+# Backup va Temp fayllar
+*.backup
+*_backup.*
+*.tmp
+*.temp
+*.bak
+
+# Python compiled va cache
+*.pyc
+__pycache__/
+.Python
+
+# Jupyter Notebook
+*.ipynb_checkpoints
+.ipynb_checkpoints/
+
+# PyInstaller
+*.spec
+dist/
+build/
 
 # ==========================================
 # IDE va OS fayllari
@@ -95,3 +135,6 @@ logs/
 .Trashes
 ehthumbs.db
 Thumbs.db
+Deploy.md
+DEPLOY.md
+IMPROVEMENTS.md
