@@ -1,0 +1,29 @@
+# NeuroAnalyst ML Pipeline - Qo'shimcha paketlar
+# Asosiy requirements.txt ga qo'shiladi
+
+# Signal qayta ishlash va EEG
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+mne>=1.4.0           # EDF/BDF yuklash va ICA
+
+# ML va Deep Learning
+torch>=2.0.0         # PyTorch (CPU/CUDA/MPS)
+scikit-learn>=1.3.0  # Classical ML, preprocessing, metrics
+xgboost>=1.7.0       # XGBoost classifier (ixtiyoriy)
+
+# PhysioNet yuklash
+wfdb>=4.0.0          # PhysioNet WaveForm DataBase
+
+# OpenNeuro yuklash (ixtiyoriy, biridirini tanlang)
+openneuro-py>=2022.1.0  # OpenNeuro Python client
+# datalad>=0.18.0      # DataLad (katta datasetlar uchun, alohida o'rnating)
+
+# Vizualizatsiya
+matplotlib>=3.7.0
+
+# Hisobotlar
+reportlab>=3.6.0     # PDF hisobotlar
+
+# Logging va boshqalar
+tqdm>=4.65.0         # Progress bar

@@ -1,0 +1,39 @@
+{
+  "generated_at": "2026-05-14T15:15:30.756001",
+  "dataset": "Synthetic EEG Demo",
+  "model": "Random Forest",
+  "metrics": {
+    "accuracy": 1.0,
+    "macro_f1": 1.0,
+    "weighted_f1": 1.0,
+    "macro_precision": 1.0,
+    "macro_recall": 1.0,
+    "cohen_kappa": 1.0,
+    "mcc": 1.0,
+    "confusion_matrix": [
+      [
+        84,
+        0
+      ],
+      [
+        0,
+        6
+      ]
+    ],
+    "sensitivity": 1.0,
+    "specificity": 1.0,
+    "ppv": 1.0,
+    "npv": 1.0,
+    "balanced_accuracy": 1.0,
+    "auroc": 1.0,
+    "class_0_f1": 1.0,
+    "class_0_precision": 1.0,
+    "class_0_recall": 1.0,
+    "class_1_f1": 1.0,
+    "class_1_precision": 1.0,
+    "class_1_recall": 1.0
+  },
+  "history_summary": null,
+  "cross_validation_folds": null,
+  "config": null
+}

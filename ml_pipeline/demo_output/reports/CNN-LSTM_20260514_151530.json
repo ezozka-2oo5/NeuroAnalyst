@@ -1,0 +1,45 @@
+{
+  "generated_at": "2026-05-14T15:15:30.755719",
+  "dataset": "Synthetic EEG Demo",
+  "model": "CNN-LSTM",
+  "metrics": {
+    "accuracy": 0.9888888888888889,
+    "macro_f1": 0.9515868746637977,
+    "weighted_f1": 0.9884167114936345,
+    "macro_precision": 0.9941176470588236,
+    "macro_recall": 0.9166666666666667,
+    "cohen_kappa": 0.9032258064516129,
+    "mcc": 0.9074852129730302,
+    "confusion_matrix": [
+      [
+        84,
+        0
+      ],
+      [
+        1,
+        5
+      ]
+    ],
+    "sensitivity": 0.8333333333333334,
+    "specificity": 1.0,
+    "ppv": 1.0,
+    "npv": 0.9882352941176471,
+    "balanced_accuracy": 0.9166666666666667,
+    "auroc": 1.0,
+    "class_0_f1": 0.9940828402366864,
+    "class_0_precision": 0.9882352941176471,
+    "class_0_recall": 1.0,
+    "class_1_f1": 0.9090909090909091,
+    "class_1_precision": 1.0,
+    "class_1_recall": 0.8333333333333334
+  },
+  "history_summary": {
+    "Jami epoch": "10",
+    "Eng yaxshi val_f1": "1.0000 (epoch 5)",
+    "Eng yaxshi val_accuracy": "1.0000",
+    "Oxirgi val_loss": "0.2407",
+    "Oxirgi learning rate": "7.50e-04"
+  },
+  "cross_validation_folds": null,
+  "config": null
+}

@@ -1,0 +1,97 @@
+# ==========================================
+# Python va Virtual Environment
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+Deploy.md
+# ==========================================
+# Maxfiy ma'lumotlar va Konfiguratsiya
+# ==========================================
+.env
+.env.local
+.env.production
+.env.development
+
+# ==========================================
+# Loyihaga oid fayllar (Ma'lumotlar bazasi va Datasetlar)
+# ==========================================
+# Ma'lumotlar bazasi
+clinical_platform.db
+clinical_platform.db-journal
+users.json
+
+# Datasetlar va fayllar
+data/*.edf
+data/*.set
+data/*.csv
+data/*.bdf
+data/raw/
+data/processed/
+data/temp/
+
+# Model og'irliklari (Katta fayllar)
+ml_pipeline/demo_output/checkpoints/*.pt
+ml_pipeline/demo_output/checkpoints/*.onnx
+ml_pipeline/real_output/checkpoints/*.pt
+ml_pipeline/real_output/checkpoints/*.onnx
+
+# Loglar va Keshlar
+logs/
+*.log
+.mplconfig/
+.pytest_cache/
+
+# ==========================================
+# IDE va OS fayllari
+# ==========================================
+# VS Code
+.vscode/
+
+# PyCharm / IntelliJ
+.idea/
+
+# Vim
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS / Windows
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

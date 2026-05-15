@@ -1,0 +1,131 @@
+{
+  "data": {
+    "physionet_dataset": "eegmmidb",
+    "openneuro_dataset_id": "ds002778",
+    "raw_data_dir": "data/raw",
+    "processed_data_dir": "data/processed",
+    "cache_dir": "data/cache",
+    "channels_to_use": null,
+    "target_sfreq": 256.0,
+    "label_map": {
+      "normal": 0,
+      "seizure": 1,
+      "artifact": 2
+    }
+  },
+  "preprocessing": {
+    "bandpass_low": 0.5,
+    "bandpass_high": 45.0,
+    "bandpass_order": 5,
+    "notch_hz": 50.0,
+    "notch_q": 30.0,
+    "reference": "average",
+    "apply_ica": false,
+    "ica_n_components": 20,
+    "ica_method": "fastica",
+    "ica_max_iter": 500,
+    "flat_channel_threshold_uv": 3.0,
+    "noisy_channel_threshold_z": 4.0,
+    "epoch_duration_sec": 4.0,
+    "epoch_overlap_sec": 2.0,
+    "baseline_correction": true,
+    "baseline_window": [
+      -0.2,
+      0.0
+    ],
+    "epoch_reject_threshold_uv": 200.0
+  },
+  "features": {
+    "use_spectral": true,
+    "use_temporal": true,
+    "use_connectivity": false,
+    "welch_nperseg": 512,
+    "welch_noverlap": 256,
+    "bands": {
+      "delta": [
+        0.5,
+        4.0
+      ],
+      "theta": [
+        4.0,
+        8.0
+      ],
+      "alpha": [
+        8.0,
+        12.0
+      ],
+      "beta": [
+        12.0,
+        30.0
+      ],
+      "gamma": [
+        30.0,
+        45.0
+      ]
+    },
+    "use_hjorth": true,
+    "use_entropy": false,
+    "use_statistics": true,
+    "scaler_type": "robust",
+    "apply_pca": false,
+    "pca_variance_ratio": 0.95
+  },
+  "model": {
+    "model_type": "cnn_lstm",
+    "n_channels": 19,
+    "n_timepoints": 1024,
+    "cnn_filters": [
+      32,
+      64,
+      128
+    ],
+    "cnn_kernel_size": 25,
+    "cnn_stride": 1,
+    "cnn_pool_size": 4,
+    "cnn_dropout": 0.25,
+    "lstm_units": 64,
+    "lstm_layers": 2,
+    "lstm_dropout": 0.3,
+    "lstm_bidirectional": true,
+    "conformer_d_model": 256,
+    "conformer_n_heads": 8,
+    "conformer_n_layers": 6,
+    "conformer_ff_dim": 1024,
+    "conformer_dropout": 0.1,
+    "n_classes": 2,
+    "final_dropout": 0.4,
+    "classical_estimator": "xgboost",
+    "classical_cv_folds": 5
+  },
+  "training": {
+    "epochs": 20,
+    "batch_size": 16,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "optimizer": "adamw",
+    "scheduler": "cosine",
+    "scheduler_warmup_epochs": 5,
+    "scheduler_min_lr": 1e-06,
+    "early_stopping_patience": 5,
+    "early_stopping_metric": "val_f1",
+    "early_stopping_mode": "max",
+    "cv_strategy": "subject_wise",
+    "n_splits": 5,
+    "test_subject_ratio": 0.2,
+    "apply_augmentation": true,
+    "aug_noise_std": 0.05,
+    "aug_time_shift_max": 50,
+    "aug_amplitude_scale": [
+      0.9,
+      1.1
+    ],
+    "use_class_weights": true,
+    "oversample_minority": false,
+    "checkpoint_dir": "ml_pipeline/checkpoints",
+    "save_best_only": true,
+    "checkpoint_metric": "val_f1",
+    "log_dir": "ml_pipeline/logs",
+    "log_every_n_steps": 10,
+    "seed": 42
+  }
+}

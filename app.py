@@ -1,9 +1,9 @@
+import base64
 import hashlib
 import hmac
 import io
 import json
 import os
-import sqlite3
 import tempfile
 import time
 from datetime import datetime
@@ -28,10 +28,18 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     mne = None
 
+try:
+    import httpx
+    _HTTPX_AVAILABLE = True
+except ImportError:
+    _HTTPX_AVAILABLE = False
 
-DB_PATH = os.path.join(BASE_DIR, "clinical_platform.db")
+# ── Backend konfiguratsiya ─────────────────────────────────────────────────
+# FastAPI backend URL — .env dan olinadi yoki default
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+
 NORMATIVE_DB_PATH = os.path.join(BASE_DIR, "data", "qeeg_norms.json")
-MODEL_VERSION = "NeuroAI Clinical Heuristic v2.2"
+MODEL_VERSION = "NeuroAI Clinical v2.2 (FastAPI+ONNX)"
 AUTH_QUERY_PARAM = "auth"
 AUTH_SESSION_TTL_SECONDS = 12 * 60 * 60
 _NORMATIVE_DB_CACHE = None
@@ -43,6 +51,7 @@ BANDS = {
     "Gamma": (30.0, 45.0),
 }
 
+# ── Fallback demo foydalanuvchilar (Backend offline bo'lganda) ──────────────
 DEMO_USERS = {
     "admin": {
         "password_hash": hashlib.sha256("admin123".encode("utf-8")).hexdigest(),
@@ -75,6 +84,7 @@ st.set_page_config(
     page_title="NeuroAnalyst",
     page_icon="N",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 
@@ -82,6 +92,9 @@ def init_session_state():
     defaults = {
         "authenticated": False,
         "user": None,
+        "jwt_access_token": None,      # FastAPI JWT token
+        "jwt_refresh_token": None,     # Yangilash uchun
+        "backend_online": None,        # FastAPI server holatini cache
         "patient_name": "Test Bemor",
         "patient_age": 34,
         "patient_gender": "Erkak",
@@ -102,8 +115,88 @@ def init_session_state():
         st.session_state.setdefault(key, value)
 
 
+# ── FastAPI Backend ulanish funksiyalari ──────────────────────────────────
+
+
+def _is_backend_online() -> bool:
+    """FastAPI backend ishlab turganini tekshiradi."""
+    if not _HTTPX_AVAILABLE:
+        return False
+    try:
+        resp = httpx.get(f"{BACKEND_URL}/health", timeout=2.0)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _api_headers() -> dict:
+    """FastAPI ga so'rov yuborish uchun header tayyorlaydi."""
+    token = st.session_state.get("jwt_access_token")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
+def backend_login(username: str, password: str) -> dict | None:
+    """
+    FastAPI /auth/login ga so'rov yuboradi.
+    Muvaffaqiyatli bo'lsa JWT tokenlar va user ma'lumotini qaytaradi.
+    """
+    if not _HTTPX_AVAILABLE:
+        return None
+    try:
+        resp = httpx.post(
+            f"{BACKEND_URL}/auth/login",
+            data={"username": username, "password": password},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=5.0,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception:
+        return None
+
+
+def backend_inference(recording: dict, access_token: str) -> dict | None:
+    """
+    FastAPI /api/v1/inference/analyze ga EEG ma'lumotini yuboradi.
+    ONNX/PyTorch inference natijasini qaytaradi.
+    """
+    if not _HTTPX_AVAILABLE or not access_token:
+        return None
+    try:
+        eeg_data = recording["data"].astype(np.float32)
+        n_channels, n_timepoints = eeg_data.shape
+        eeg_b64 = base64.b64encode(eeg_data.tobytes()).decode("ascii")
+
+        payload = {
+            "eeg_data_b64": eeg_b64,
+            "n_channels": n_channels,
+            "n_timepoints": n_timepoints,
+            "sfreq": float(recording.get("sfreq", 256.0)),
+            "channel_names": recording.get("channel_names", []),
+            "patient_id": "streamlit-patient",
+        }
+        resp = httpx.post(
+            f"{BACKEND_URL}/api/v1/inference/analyze",
+            json=payload,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=30.0,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception as e:
+        print(f"Backend inference xatosi: {e}")
+        return None
+
+
+# ── Auth yordamchi funksiyalar ─────────────────────────────────────────────
+
+
 def get_auth_secret():
-    return os.environ.get("NEUROANALYST_AUTH_SECRET", f"{MODEL_VERSION}:{DB_PATH}")
+    return os.environ.get("NEUROANALYST_AUTH_SECRET", f"{MODEL_VERSION}:local")
 
 
 def build_auth_token(username):
@@ -116,13 +209,11 @@ def build_auth_token(username):
 def verify_auth_token(token):
     if not token:
         return None
-
     try:
         username, expires_at_text, signature = str(token).split(":", 2)
         expires_at = int(expires_at_text)
     except (TypeError, ValueError):
         return None
-
     payload = f"{username}:{expires_at}"
     expected_signature = hmac.new(
         get_auth_secret().encode("utf-8"),
@@ -145,19 +236,24 @@ def clear_persisted_login():
         del st.query_params[AUTH_QUERY_PARAM]
 
 
-def apply_authenticated_user(username):
-    user = DEMO_USERS[username]
+def apply_authenticated_user(username, jwt_data: dict | None = None):
+    user = DEMO_USERS.get(username, {})
     st.session_state.authenticated = True
     st.session_state.user = {
         "username": username,
-        "role": user["role"],
-        "name": user["name"],
+        "role": jwt_data["user"]["role"] if jwt_data else user.get("role", "viewer"),
+        "name": jwt_data["user"].get("full_name", username.title()) if jwt_data else user.get("name", username),
     }
+    if jwt_data:
+        st.session_state.jwt_access_token = jwt_data.get("access_token")
+        st.session_state.jwt_refresh_token = jwt_data.get("refresh_token")
 
 
 def reset_auth_state():
     st.session_state.authenticated = False
     st.session_state.user = None
+    st.session_state.jwt_access_token = None
+    st.session_state.jwt_refresh_token = None
 
 
 def restore_login_from_query_params():
@@ -176,199 +272,139 @@ def restore_login_from_query_params():
     return True
 
 
-def get_connection():
-    connection = sqlite3.connect(DB_PATH, check_same_thread=False)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-def init_database():
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS patients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            patient_code TEXT UNIQUE,
-            full_name TEXT NOT NULL,
-            age INTEGER,
-            gender TEXT,
-            department TEXT,
-            clinical_note TEXT,
-            created_at TEXT,
-            updated_at TEXT
-        )
-        """
-    )
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS studies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            patient_id INTEGER NOT NULL,
-            source_name TEXT,
-            source_type TEXT,
-            duration_sec REAL,
-            sfreq REAL,
-            channel_count INTEGER,
-            signal_quality REAL,
-            artifact_ratio REAL,
-            seizure_risk REAL,
-            label TEXT,
-            confidence REAL,
-            dominant_channel TEXT,
-            recommendation TEXT,
-            report_text TEXT,
-            created_at TEXT,
-            FOREIGN KEY(patient_id) REFERENCES patients(id)
-        )
-        """
-    )
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            action TEXT,
-            detail TEXT,
-            created_at TEXT
-        )
-        """
-    )
-    connection.commit()
-    connection.close()
-
-
 def log_audit(action, detail):
-    user = st.session_state.get("user")
-    username = user["username"] if user else "anonymous"
-    connection = get_connection()
-    connection.execute(
-        "INSERT INTO audit_logs (username, action, detail, created_at) VALUES (?, ?, ?, ?)",
-        (username, action, detail, datetime.now().isoformat(timespec="seconds")),
-    )
-    connection.commit()
-    connection.close()
+    """Backend orqali log yozish."""
+    if _HTTPX_AVAILABLE:
+        try:
+            httpx.post(
+                f"{BACKEND_URL}/api/v1/admin/logs",
+                json={"action": action, "detail": detail},
+                headers=_api_headers(),
+                timeout=2.0
+            )
+        except:
+            pass
 
 
 def save_patient(patient):
-    now = datetime.now().isoformat(timespec="seconds")
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        INSERT INTO patients (patient_code, full_name, age, gender, department, clinical_note, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(patient_code) DO UPDATE SET
-            full_name = excluded.full_name,
-            age = excluded.age,
-            gender = excluded.gender,
-            department = excluded.department,
-            clinical_note = excluded.clinical_note,
-            updated_at = excluded.updated_at
-        """,
-        (
-            patient["patient_id"],
-            patient["name"],
-            patient["age"],
-            patient["gender"],
-            patient["department"],
-            patient["clinical_note"],
-            now,
-            now,
-        ),
-    )
-    connection.commit()
-    row = connection.execute(
-        "SELECT id FROM patients WHERE patient_code = ?",
-        (patient["patient_id"],),
-    ).fetchone()
-    connection.close()
-    log_audit("save_patient", patient["patient_id"])
-    return int(row["id"])
+    if not _HTTPX_AVAILABLE:
+        st.error("Backend offline. Saqlab bo'lmaydi.")
+        return -1
+    
+    payload = {
+        "patient_code": patient["patient_id"],
+        "full_name": patient["name"],
+        "age": patient["age"],
+        "gender": patient["gender"],
+        "department": patient["department"],
+        "clinical_note": patient["clinical_note"],
+    }
+    
+    try:
+        resp = httpx.post(f"{BACKEND_URL}/api/v1/patients/", json=payload, headers=_api_headers(), timeout=10.0)
+        if resp.status_code in (200, 201):
+            return resp.json().get("id", -1)
+        st.error(f"Xato: {resp.json().get('detail')}")
+        return -1
+    except Exception as e:
+        st.error(f"Xato: {e}")
+        return -1
 
 
 def save_study(patient_db_id, recording, analysis, report_text):
-    connection = get_connection()
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        INSERT INTO studies (
-            patient_id, source_name, source_type, duration_sec, sfreq, channel_count,
-            signal_quality, artifact_ratio, seizure_risk, label, confidence,
-            dominant_channel, recommendation, report_text, created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            patient_db_id,
-            recording["source_name"],
-            recording["source_type"],
-            recording["data"].shape[1] / recording["sfreq"],
-            recording["sfreq"],
-            recording["data"].shape[0],
-            analysis["signal_quality"],
-            analysis["artifact_ratio"],
-            analysis["risk_score"],
-            analysis["label"],
-            analysis["confidence"],
-            analysis["dominant_channel"],
-            analysis["recommendation"],
-            report_text,
-            datetime.now().isoformat(timespec="seconds"),
-        ),
-    )
-    connection.commit()
-    study_id = cursor.lastrowid
-    connection.close()
-    log_audit("save_study", f"study_id={study_id}")
-    return study_id
+    if patient_db_id == -1 or not _HTTPX_AVAILABLE:
+        return -1
+        
+    payload = {
+        "source_name": recording.get("source_name", "unknown"),
+        "source_type": recording.get("source_type", "unknown"),
+        "duration_sec": float(recording["data"].shape[1] / recording["sfreq"]),
+        "sfreq": float(recording["sfreq"]),
+        "channel_count": int(recording["data"].shape[0]),
+        "signal_quality": float(analysis.get("signal_quality", 0)),
+        "artifact_ratio": float(analysis.get("artifact_ratio", 0)),
+        "seizure_risk": float(analysis.get("risk_score", 0)),
+        "label": str(analysis.get("label", "")),
+        "confidence": float(analysis.get("confidence", 0)),
+        "dominant_channel": str(analysis.get("dominant_channel", "")),
+        "recommendation": str(analysis.get("recommendation", "")),
+        "report_text": str(report_text),
+    }
+
+    try:
+        resp = httpx.post(f"{BACKEND_URL}/api/v1/patients/{patient_db_id}/studies", json=payload, headers=_api_headers(), timeout=10.0)
+        if resp.status_code == 201:
+            log_audit("save_study", f"study_id={resp.json().get('id')}")
+            return resp.json().get("id", -1)
+        st.error(f"Study saqlashda xato: {resp.json().get('detail')}")
+        return -1
+    except Exception as e:
+        st.error(f"Xato: {e}")
+        return -1
 
 
 def load_patients():
-    connection = get_connection()
-    dataframe = pd.read_sql_query(
-        """
-        SELECT id, patient_code, full_name, age, gender, department, clinical_note, updated_at
-        FROM patients
-        ORDER BY updated_at DESC
-        """,
-        connection,
-    )
-    connection.close()
-    return dataframe
+    if not _HTTPX_AVAILABLE:
+        return pd.DataFrame()
+    try:
+        resp = httpx.get(f"{BACKEND_URL}/api/v1/patients/?limit=500", headers=_api_headers(), timeout=5.0)
+        if resp.status_code == 200:
+            return pd.DataFrame(resp.json())
+        return pd.DataFrame()
+    except:
+        return pd.DataFrame()
 
 
 def load_recent_studies(limit=25):
-    connection = get_connection()
-    dataframe = pd.read_sql_query(
-        f"""
-        SELECT s.id, p.patient_code, p.full_name, s.label, s.confidence, s.signal_quality,
-               s.artifact_ratio, s.seizure_risk, s.dominant_channel, s.created_at
-        FROM studies s
-        JOIN patients p ON p.id = s.patient_id
-        ORDER BY s.created_at DESC
-        LIMIT {int(limit)}
-        """,
-        connection,
-    )
-    connection.close()
-    return dataframe
+    if not _HTTPX_AVAILABLE:
+        return pd.DataFrame()
+    try:
+        resp = httpx.get(f"{BACKEND_URL}/api/v1/patients/studies/recent?limit={limit}", headers=_api_headers(), timeout=5.0)
+        if resp.status_code == 200:
+            return pd.DataFrame(resp.json())
+        return pd.DataFrame()
+    except:
+        return pd.DataFrame()
 
 
 def load_audit_logs(limit=40):
-    connection = get_connection()
-    dataframe = pd.read_sql_query(
-        f"SELECT username, action, detail, created_at FROM audit_logs ORDER BY created_at DESC LIMIT {int(limit)}",
-        connection,
-    )
-    connection.close()
-    return dataframe
+    if not _HTTPX_AVAILABLE:
+        return pd.DataFrame()
+    try:
+        resp = httpx.get(f"{BACKEND_URL}/api/v1/admin/audit-logs?limit={limit}", headers=_api_headers(), timeout=5.0)
+        if resp.status_code == 200:
+            return pd.DataFrame(resp.json())
+        return pd.DataFrame()
+    except:
+        return pd.DataFrame()
+
 
 
 def inject_styles():
     st.markdown(
         """
         <style>
+            /* ── Menyu yashirish ───────────────────────────────────────── */
+            [data-testid="stHeader"] { background: transparent !important; }
+            [data-testid="stToolbar"] { display: none !important; }
+            [data-testid="stActionElements"] { display: none !important; }
+            #MainMenu { display: none !important; }
+            .stDeployButton { display: none !important; }
+
+            /* ── Sidebar doimo ko'rinib tursin ─────────────────────────── */
+            [data-testid="stSidebarCollapsedControl"] { display: none !important; }
+            button[data-testid="stBaseButton-headerNoPadding"] { display: none !important; }
+            section[data-testid="stSidebar"] {
+                width: 18rem !important;
+                min-width: 18rem !important;
+                transform: none !important;
+                visibility: visible !important;
+                display: flex !important;
+            }
+            section[data-testid="stSidebar"] > div:first-child {
+                width: 18rem !important;
+            }
+
             :root {
                 --na-page: #07111f;
                 --na-surface: #10233a;
@@ -394,6 +430,17 @@ def inject_styles():
                     radial-gradient(circle at 12% 12%, rgba(34, 211, 238, 0.12), transparent 20%),
                     radial-gradient(circle at 82% 8%, rgba(100, 255, 218, 0.10), transparent 18%),
                     linear-gradient(180deg, #08101c 0%, #0a1627 100%);
+            }
+            /* ── Login Video Background ────────────────────────────── */
+            #na-login-video {
+                position: fixed;
+                top: 0; left: 0;
+                width: 100vw; height: 100vh;
+                object-fit: cover;
+                z-index: -1;
+                opacity: 0.9;
+                filter: blur(6px) brightness(0.5);
+                pointer-events: none;
             }
             [data-testid="stSidebar"] {
                 background: linear-gradient(180deg, #0e1d31 0%, #13253d 100%);
@@ -530,6 +577,41 @@ def inject_styles():
     )
 
 
+# ── Login Video Background ──────────────────────────────────────────────────
+
+
+@st.cache_data(show_spinner=False)
+def _get_video_b64() -> str:
+    """background.mp4 ni base64 ga aylantirib qaytaradi (bir marta cache da)."""
+    video_path = os.path.join(BASE_DIR, "background.mp4")
+    if not os.path.exists(video_path):
+        return ""
+    with open(video_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("ascii")
+
+
+def inject_login_video():
+    """Login sahifasida fullscreen video background chiqaradi."""
+    video_b64 = _get_video_b64()
+    if not video_b64:
+        return  # Fayl topilmasa, oddiy background qoladi
+    st.markdown(
+        f"""
+        <style>
+            .stApp {{
+                background: transparent !important;
+            }}
+            header[data-testid="stHeader"] {{
+                background: transparent !important;
+            }}
+        </style>
+        <video id="na-login-video" autoplay loop muted playsinline>
+            <source src="data:video/mp4;base64,{video_b64}" type="video/mp4">
+        </video>
+        """,
+        unsafe_allow_html=True,
+    )
+
 def render_metric_card(label, value):
     st.markdown(
         f"""
@@ -560,37 +642,170 @@ def style_figure(figure):
     figure.patch.set_facecolor("#ffffff")
 
 
+@st.dialog("Profilni tahrirlash")
+def edit_profile_dialog(current_username: str, access_token: str | None):
+    st.write("Profil ma'lumotlarini o'zgartirish")
+
+    new_username = st.text_input("Yangi login (ixtiyoriy)", value=current_username)
+    new_name = st.text_input("Yangi ism (ixtiyoriy)", placeholder="Ism familiyangiz")
+    new_password = st.text_input("Yangi parol (ixtiyoriy)", type="password", placeholder="Yangi parolni kiriting")
+
+    if st.button("Saqlash", type="primary"):
+        payload = {}
+        if new_username and new_username != current_username:
+            payload["username"] = new_username
+        if new_name:
+            payload["full_name"] = new_name
+        if new_password:
+            payload["password"] = new_password
+
+        if not payload:
+            st.info("Hech narsa o'zgarmadi.")
+            return
+
+        backend_ok = st.session_state.get("backend_online")
+
+        # ── 1. Backend online bo'lsa — FastAPI orqali ──────────────────
+        if backend_ok and access_token and _HTTPX_AVAILABLE:
+            try:
+                resp = httpx.put(
+                    f"{BACKEND_URL}/auth/me",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    json=payload,
+                    timeout=5.0
+                )
+                if resp.status_code == 200:
+                    st.success("Profil yangilandi! Qaytadan tizimga kiring.")
+                    time.sleep(1)
+                    clear_persisted_login()
+                    reset_auth_state()
+                    st.rerun()
+                    return
+                else:
+                    st.error(f"Xato: {resp.json().get('detail', 'Nomalum xato')}")
+                    return
+            except Exception:
+                pass  # Backend javob bermasa, to'g'ridan-to'g'ri DBga
+
+        # ── 2. Demo rejim yoki backend offline — to'g'ridan-to'g'ri DB ─
+        try:
+            from backend.auth.user_manager import update_profile
+            from backend.models.db import get_db
+
+            db = next(get_db())
+            try:
+                user = update_profile(
+                    db=db,
+                    current_username=current_username,
+                    new_username=payload.get("username"),
+                    full_name=payload.get("full_name"),
+                    new_password=payload.get("password"),
+                )
+                if user:
+                    st.success("Profil yangilandi! Qaytadan tizimga kiring.")
+                    time.sleep(1)
+                    clear_persisted_login()
+                    reset_auth_state()
+                    st.rerun()
+                else:
+                    st.error("Foydalanuvchi topilmadi.")
+            except ValueError as e:
+                st.error(str(e))
+            finally:
+                db.close()
+        except Exception as e:
+            st.error(f"Ma'lumotlar bazasiga ulanib bo'lmadi: {e}")
+
+
+
 def check_password():
     restore_login_from_query_params()
 
     if st.session_state.get("authenticated"):
         user = st.session_state.get("user") or {}
         display_name = user.get("name") or "Noma'lum"
-        st.sidebar.success(f"Kirgan foydalanuvchi: {display_name}")
+        role = user.get("role", "viewer")
+
+        # Rol badge
+        role_emoji = {"admin": "🔴 Admin", "doctor": "🟢 Shifokor", "viewer": "🔵 Kuzatuvchi"}.get(role, role)
+        st.sidebar.success(f"👤 {display_name}")
+        st.sidebar.caption(f"Rol: **{role_emoji}**")
+
+        # Backend holati
+        backend_ok = st.session_state.get("backend_online")
+        if backend_ok is True:
+            st.sidebar.caption("🟢 FastAPI Backend: Ulanish bor")
+        elif backend_ok is False:
+            st.sidebar.caption("🟡 Demo rejim (Backend offline)")
+
+        username = user.get("username", "unknown")
+        access_token = st.session_state.get("jwt_access_token")
+
+        if st.sidebar.button("⚙ Profilni tahrirlash", use_container_width=True):
+            edit_profile_dialog(username, access_token)
+
         if st.sidebar.button("Chiqish", use_container_width=True):
-            username = user.get("username", "unknown")
+            # FastAPI logout
+            if access_token and _HTTPX_AVAILABLE:
+                try:
+                    httpx.post(
+                        f"{BACKEND_URL}/auth/logout",
+                        headers={"Authorization": f"Bearer {access_token}"},
+                        timeout=3.0,
+                    )
+                except Exception:
+                    pass
             clear_persisted_login()
             reset_auth_state()
             log_audit("logout", f"user={username}")
             st.rerun()
         return True
 
-    st.sidebar.header("Kirish")
-    username = st.sidebar.text_input("Foydalanuvchi nomi")
-    password = st.sidebar.text_input("Parol", type="password")
+    st.sidebar.header("🔐 Kirish")
 
-    if st.sidebar.button("Kirish", use_container_width=True):
-        user = DEMO_USERS.get(username)
-        password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
-        if user and password_hash == user["password_hash"]:
-            apply_authenticated_user(username)
-            persist_login(username)
-            log_audit("login", f"user={username}")
-            st.rerun()
-        st.sidebar.error("Login yoki parol xato.")
+    # Backend holati tekshirish (cache 10 soniya)
+    if st.session_state.get("backend_online") is None:
+        st.session_state.backend_online = _is_backend_online()
+    backend_ok = st.session_state.backend_online
 
-    st.sidebar.caption("Demo hisoblar: admin / admin123, doctor / doctor123")
+    if backend_ok:
+        st.sidebar.caption("🟢 **FastAPI Backend** ga ulanilgan — JWT autentifikatsiya")
+    else:
+        st.sidebar.caption("🟡 **Demo rejim** — Backend offline (admin/admin123)")
+
+    username = st.sidebar.text_input("Foydalanuvchi nomi", key="login_username")
+    password = st.sidebar.text_input("Parol", type="password", key="login_password")
+
+    if st.sidebar.button("Kirish", use_container_width=True, type="primary"):
+        # 1. FastAPI backend orqali JWT login
+        if backend_ok:
+            jwt_data = backend_login(username, password)
+            if jwt_data:
+                apply_authenticated_user(username, jwt_data=jwt_data)
+                persist_login(username)
+                log_audit("login", f"user={username} mode=JWT")
+                st.rerun()
+            else:
+                st.sidebar.error("Login yoki parol xato (JWT).")
+        else:
+            # 2. Demo fallback — SHA-256 tekshiruvi
+            user = DEMO_USERS.get(username)
+            password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            if user and password_hash == user["password_hash"]:
+                apply_authenticated_user(username, jwt_data=None)
+                persist_login(username)
+                log_audit("login", f"user={username} mode=demo")
+                st.rerun()
+            else:
+                st.sidebar.error("Login yoki parol xato.")
+
+    if not backend_ok:
+        st.sidebar.caption("Demo hisoblar: admin / admin123, doctor / doctor123")
+
+    # Login sahifasida video background
+    inject_login_video()
     return False
+
 
 
 def normalize_orientation(data):
@@ -1485,15 +1700,276 @@ def get_recommended_window_start(events, preview_seconds, total_duration):
     return float(np.clip(first_event_center - preview_seconds / 2, 0.0, max_start))
 
 
+@st.cache_resource
+def _get_backend_model_status() -> dict:
+    """FastAPI backend model holatini tekshiradi (cached)."""
+    if not _HTTPX_AVAILABLE:
+        return {"is_ready": False, "model_type": "unavailable"}
+    try:
+        resp = httpx.get(f"{BACKEND_URL}/api/v1/inference/status", timeout=3.0)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return {"is_ready": False, "model_type": "offline"}
+
+
+def run_api_inference(recording: dict) -> float | None:
+    """
+    FastAPI backend orqali EEG inference qiladi.
+    JWT token st.session_state dan olinadi.
+
+    Returns:
+        float — seizure ehtimolligi (0-100), yoki None (xato bo'lsa).
+    """
+    access_token = st.session_state.get("jwt_access_token")
+    result = backend_inference(recording, access_token)
+    if result is None:
+        return None
+    return float(result.get("seizure_probability", 0.0))
+
+
+
 def main():
     init_session_state()
-    init_database()
     inject_styles()
+
 
     if not check_password():
         return
 
     user = st.session_state["user"]
+    role = user.get("role", "viewer")
+    
+    # Mahalliy RBAC tekshiruvi (backend bilan mos)
+    _ROLE_CAN = {
+        "admin": {
+            "patients_write", "patients_delete", "inference_run",
+            "reports_generate", "users_read", "users_write", "audit_read", "system_settings"
+        },
+        "doctor": {
+            "patients_write", "inference_run", "reports_generate"
+        },
+        "viewer": set(),
+    }
+    _can = _ROLE_CAN.get(role, set())
+
+    def can(perm: str) -> bool:
+        if role == "admin":
+            return True
+        return perm in _can
+
+    # ── Sahifa Navigatsiyasi (Sidebar) ──────────────────────────────────
+    pages = ["Klinik Platforma"]
+    if can("audit_read") or can("users_read"):
+        pages.append("RBAC Boshqaruv (Admin)")
+        
+    st.sidebar.markdown("---")
+    selected_page = st.sidebar.radio("Sahifani tanlang", pages)
+    
+    if selected_page == "RBAC Boshqaruv (Admin)":
+        st.markdown("<div class=\"section-kicker\">Governance</div><div class=\"section-title\">Admin boshqaruv paneli (RBAC)</div>", unsafe_allow_html=True)
+        admin_tabs = st.tabs(["📊 Tizim holati", "👥 Foydalanuvchilar", "🔐 Ruxsatlar (RBAC)", "📋 Audit Log"])
+
+        with admin_tabs[0]:
+            st.markdown("### Tizim ko'rsatkichlari")
+            adm1, adm2, adm3, adm4 = st.columns(4)
+            with adm1:
+                render_metric_card("Model versiyasi", MODEL_VERSION)
+            with adm2:
+                render_metric_card("Bemorlar soni", str(len(load_patients())))
+            with adm3:
+                render_metric_card("Study soni", str(len(load_recent_studies(limit=200))))
+            with adm4:
+                render_metric_card("Sizning rolingiz", role.upper())
+
+            if can("system_settings"):
+                st.markdown("### Backend API Statistikasi")
+                access_token = st.session_state.get("jwt_access_token")
+                if access_token and _HTTPX_AVAILABLE:
+                    try:
+                        resp = httpx.get(
+                            f"{BACKEND_URL}/api/v1/admin/stats",
+                            headers={"Authorization": f"Bearer {access_token}"},
+                            timeout=5.0,
+                        )
+                        if resp.status_code == 200:
+                            stats = resp.json()
+                            sc1, sc2, sc3, sc4 = st.columns(4)
+                            sc1.metric("Foydalanuvchilar", stats.get("total_users", "N/A"))
+                            sc2.metric("Bemorlar", stats.get("total_patients", "N/A"))
+                            sc3.metric("Tekshiruvlar", stats.get("total_studies", "N/A"))
+                            sc4.metric("Audit yozuvlar", stats.get("total_audit_logs", "N/A"))
+                            st.caption("Rollarga ko'ra foydalanuvchilar taqsimoti:")
+                            st.json(stats.get("users_by_role", {}))
+                    except Exception as e:
+                        st.caption(f"Backend statistikasi yuklanmadi: {e}")
+
+        with admin_tabs[1]:
+            if can("users_read") or can("users_write"):
+                st.markdown("### 👥 Tizim foydalanuvchilari")
+                access_token = st.session_state.get("jwt_access_token")
+                
+                # Demo foydalanuvchilar (backend offline bo'lganda ko'rsatiladi)
+                _demo_users = [
+                    {"id": 1, "username": "admin", "full_name": "Tizim Administratori", "role": "admin", "is_active": True, "last_login": "2026-05-15"},
+                    {"id": 2, "username": "dr_smith", "full_name": "Dr. Ali Sobirov", "role": "doctor", "is_active": True, "last_login": "2026-05-14"},
+                    {"id": 3, "username": "nurse01", "full_name": "Malika Yusupova", "role": "viewer", "is_active": True, "last_login": "2026-05-13"},
+                ]
+
+                # Backend dan olishga urinish
+                users_data = None
+                backend_online = False
+                if access_token and _HTTPX_AVAILABLE:
+                    try:
+                        resp = httpx.get(
+                            f"{BACKEND_URL}/api/v1/admin/users",
+                            headers={"Authorization": f"Bearer {access_token}"},
+                            timeout=5.0,
+                        )
+                        if resp.status_code == 200:
+                            users_data = resp.json()
+                            backend_online = True
+                    except Exception:
+                        pass
+
+                if not backend_online:
+                    st.warning("⚠️ Backend offline — Demo ma'lumotlar ko'rsatilmoqda. Haqiqiy boshqaruv uchun FastAPI serverni yoqing.")
+                    users_data = _demo_users
+
+                if users_data:
+                    users_df = pd.DataFrame(users_data)
+                    display_cols = [c for c in ["id", "username", "full_name", "role", "is_active", "last_login"] if c in users_df.columns]
+                    st.dataframe(users_df[display_cols], use_container_width=True, hide_index=True)
+
+                    st.markdown("---")
+                    col_edit, col_add = st.columns(2)
+
+                    with col_edit:
+                        if can("users_write"):
+                            st.markdown("#### ✏️ Foydalanuvchini tahrirlash")
+                            if not backend_online:
+                                st.info("🔒 Tahrirlash faqat backend online bo'lganda ishlaydi.")
+                            else:
+                                selected_username = st.selectbox("Foydalanuvchini tanlang", users_df["username"].tolist())
+                                if selected_username:
+                                    user_info = users_df[users_df["username"] == selected_username].iloc[0]
+                                    with st.form(f"edit_form_{selected_username}"):
+                                        new_fullname = st.text_input("To'liq ism", value=user_info["full_name"])
+                                        new_role = st.selectbox("Rol", ["admin", "doctor", "viewer"], index=["admin", "doctor", "viewer"].index(user_info["role"]))
+                                        new_password = st.text_input("Yangi parol (bo'sh qoldiring — o'zgarmaydi)", type="password")
+                                        if st.form_submit_button("Saqlash"):
+                                            payload = {"new_role": new_role, "full_name": new_fullname}
+                                            if new_password:
+                                                payload["new_password"] = new_password
+                                            upd_resp = httpx.put(
+                                                f"{BACKEND_URL}/api/v1/admin/users/{selected_username}",
+                                                json=payload,
+                                                headers={"Authorization": f"Bearer {access_token}"},
+                                                timeout=5.0
+                                            )
+                                            if upd_resp.status_code == 200:
+                                                st.success(f"✅ '{selected_username}' yangilandi!")
+                                                st.rerun()
+                                            else:
+                                                st.error(f"Xato: {upd_resp.json().get('detail', 'Xato')}")
+
+                                    if can("users_delete") and selected_username != user["name"]:
+                                        if st.button("🚫 Bloklash / O'chirish", type="primary"):
+                                            del_resp = httpx.delete(
+                                                f"{BACKEND_URL}/api/v1/admin/users/{selected_username}",
+                                                headers={"Authorization": f"Bearer {access_token}"},
+                                                timeout=5.0
+                                            )
+                                            if del_resp.status_code == 200:
+                                                st.success(f"🚫 '{selected_username}' bloklandi!")
+                                                st.rerun()
+                                            else:
+                                                st.error(f"Xato: {del_resp.json().get('detail', 'Xato')}")
+
+                    with col_add:
+                        if can("users_write"):
+                            st.markdown("#### ➕ Yangi foydalanuvchi qo'shish")
+                            if not backend_online:
+                                st.info("🔒 Yangi foydalanuvchi qo'shish faqat backend online bo'lganda ishlaydi.")
+                            else:
+                                with st.form("new_user_form"):
+                                    nu_username = st.text_input("Yangi Username")
+                                    nu_password = st.text_input("Parol", type="password")
+                                    nu_fullname = st.text_input("To'liq ism")
+                                    nu_role = st.selectbox("Rol", ["doctor", "viewer", "admin"])
+                                    if st.form_submit_button("Yaratish", use_container_width=True):
+                                        if nu_username and nu_password and nu_fullname:
+                                            create_resp = httpx.post(
+                                                f"{BACKEND_URL}/api/v1/admin/users",
+                                                json={"username": nu_username, "password": nu_password,
+                                                      "full_name": nu_fullname, "role": nu_role},
+                                                headers={"Authorization": f"Bearer {access_token}"},
+                                                timeout=5.0,
+                                            )
+                                            if create_resp.status_code == 201:
+                                                st.success(f"✅ '{nu_username}' yaratildi!")
+                                                st.rerun()
+                                            else:
+                                                st.error(f"Xato: {create_resp.json().get('detail', 'Nomalum xato')}")
+                                        else:
+                                            st.warning("Barcha maydonlarni to'ldiring!")
+
+        with admin_tabs[2]:
+            st.markdown("### 🔐 Ruxsatlar matritsasi (Role-Based Access Control)")
+            
+            # Mahalliy RBAC matritsasi (har doim ko'rsatiladi)
+            _local_perms = {
+                "admin":   ["patients_write", "patients_delete", "inference_run", "reports_generate", "users_read", "users_write", "users_delete", "audit_read", "system_settings"],
+                "doctor":  ["patients_write", "inference_run", "reports_generate"],
+                "viewer":  [],
+            }
+            all_perms = sorted(set(p for lst in _local_perms.values() for p in lst))
+            matrix = []
+            for p in all_perms:
+                row = {"Ruxsat (Permission)": p}
+                for r in ["admin", "doctor", "viewer"]:
+                    row[r.capitalize()] = "✅" if p in _local_perms[r] else "❌"
+                matrix.append(row)
+            st.dataframe(pd.DataFrame(matrix), use_container_width=True, hide_index=True)
+            st.info("Eslatma: Admin barcha ruxsatlarga ega. Shifokor tahrirlash huquqiga ega. Kuzatuvchi faqat o'qishi mumkin.")
+
+        with admin_tabs[3]:
+            if can("audit_read"):
+                st.markdown("### 📋 Tizim Audit Jurnali")
+                access_token = st.session_state.get("jwt_access_token")
+                if access_token and _HTTPX_AVAILABLE:
+                    try:
+                        resp = httpx.get(
+                            f"{BACKEND_URL}/api/v1/admin/audit-logs?limit=100",
+                            headers={"Authorization": f"Bearer {access_token}"},
+                            timeout=5.0,
+                        )
+                        if resp.status_code == 200:
+                            logs = resp.json()
+                            if logs:
+                                audit_api_df = pd.DataFrame(logs)
+                                st.dataframe(audit_api_df, use_container_width=True, hide_index=True)
+                            else:
+                                st.info("Audit log bo'sh.")
+                        else:
+                            st.error("Audit log yuklanmadi.")
+                    except Exception:
+                        audit_df = load_audit_logs()
+                        if not audit_df.empty:
+                            st.dataframe(audit_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("Audit log hali bo'sh.")
+                else:
+                    audit_df = load_audit_logs()
+                    if not audit_df.empty:
+                        st.dataframe(audit_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("Audit log hali bo'sh.")
+        
+        return  # Admin panelni ko'rsatgandan so'ng, asosiy klinik qismlarni chizmaslik uchun
+
+    # ── Asosiy Klinik Platforma ───────────────────────────────────────────
     st.markdown(
         f"""
         <div class="hero-shell">
@@ -1605,7 +2081,7 @@ def main():
                 st.session_state.saved_patient_db_id = save_patient(patient_payload)
                 st.success("Bemor registrga saqlandi.")
         with save_col2:
-            st.caption("Bemor registri, keyingi EEGlar va audit log platforma ichida lokal SQLite bazada saqlanadi.")
+            st.caption("Bemor registri, keyingi EEGlar va audit log platforma ichida PostgreSQL bazada saqlanadi.")
 
     raw_recording = st.session_state.get("raw_recording")
     if raw_recording is None:
@@ -1639,6 +2115,19 @@ def main():
     if st.button("Klinik tahlilni ishga tushirish", type="primary", use_container_width=True):
         clean_recording = preprocess_recording(raw_recording, low_cut, high_cut, notch_hz, apply_notch)
         analysis = build_analysis(clean_recording, notch_hz, patient)
+        
+        # --- FastAPI Backend ML Inference ---
+        ml_prob = run_api_inference(raw_recording)
+
+        if ml_prob is not None:
+            analysis["ml_seizure_prob"] = ml_prob
+            analysis["ml_label"] = "Epileptiform (Patologik)" if ml_prob >= 50.0 else "Normal"
+        else:
+            analysis["ml_seizure_prob"] = None
+            analysis["ml_label"] = "Backend offline / ML yuklanmadi"
+        # ------------------------------------
+
+        
         report_text = build_report_text(patient, clean_recording, analysis)
         report_pdf = build_report_pdf(patient, clean_recording, analysis, report_text)
         patient_db_id = save_patient(patient)
@@ -1658,23 +2147,32 @@ def main():
         st.warning("Signal tayyor. Klinik tahlilni ishga tushirish tugmasini bosing.")
         return
 
-    summary1, summary2, summary3, summary4, summary5 = st.columns(5)
+    summary1, summary2, summary3, summary4, summary5, summary6 = st.columns(6)
     with summary1:
-        st.metric("AI yorlig'i", analysis["label"])
+        st.metric("Heuristik", analysis["label"])
     with summary2:
-        st.metric("Ishonch", f"{analysis['confidence']:.1f}%")
+        ml_txt = f"{analysis.get('ml_seizure_prob', 0):.1f}%" if analysis.get("ml_seizure_prob") is not None else "N/A"
+        st.metric("DL Seizure Prob", ml_txt)
     with summary3:
-        st.metric("Signal sifati", f"{analysis['signal_quality']:.1f}%")
+        st.metric("Ishonch", f"{analysis['confidence']:.1f}%")
     with summary4:
-        st.metric("Seizure risk", f"{analysis['risk_score']:.1f}/100")
+        st.metric("Signal sifati", f"{analysis['signal_quality']:.1f}%")
     with summary5:
-        st.metric("Normativ qiyos", analysis["normative"]["overall_status"])
+        st.metric("Risk Score", f"{analysis['risk_score']:.1f}/100")
+    with summary6:
+        st.metric("Normativ", analysis["normative"]["overall_status"])
 
-    dashboard_tab, signal_tab, ai_tab, registry_tab, admin_tab = st.tabs(
-        ["Dashboard", "Signal Review", "AI Findings", "Patient Registry", "Reports & Admin"]
-    )
+    # ── Tablar (faqat ruxsat bo'lganlari) ────────────────────────────────
+    all_tabs = ["📊 Dashboard", "📈 Signal Review", "🤖 AI Findings", "🗂 Bemor Registri"]
 
-    with dashboard_tab:
+    if can("reports_generate"):
+        all_tabs.append("📄 Hisobotlar")
+
+    tabs = st.tabs(all_tabs)
+    tab_idx = {name: i for i, name in enumerate(all_tabs)}
+
+    # ── 1. Dashboard (barcha rollar) ──────────────────────────────────────
+    with tabs[tab_idx["📊 Dashboard"]]:
         st.markdown("<div class=\"section-kicker\">Clinical Overview</div><div class=\"section-title\">Klinik boshqaruv paneli</div>", unsafe_allow_html=True)
         left, middle, right = st.columns([1.1, 1, 1])
         with left:
@@ -1686,10 +2184,12 @@ def main():
             render_metric_card("Line noise", f"{analysis['line_noise_ratio']:.1f}%")
             render_metric_card("EMG noise", f"{analysis['emg_ratio']:.1f}%")
         with right:
+            render_metric_card("Deep Learning (CNN-LSTM)", analysis.get("ml_label", "N/A"))
+            ml_prob_val = analysis.get("ml_seizure_prob")
+            ml_prob_txt = f"{ml_prob_val:.1f}%" if ml_prob_val is not None else "N/A"
+            render_metric_card("DL Seizure Ehtimoli", ml_prob_txt)
             render_metric_card("Shubhali segmentlar", str(len(analysis["events"])))
             render_metric_card("Dominant kanal", analysis["dominant_channel"])
-            render_metric_card("Normativ profil", analysis["normative"]["profile_label"])
-            render_metric_card("So'nggi study ID", str(st.session_state.last_saved_study_id or "-"))
 
         st.info(analysis["recommendation"])
         total_duration = clean_recording["data"].shape[1] / clean_recording["sfreq"]
@@ -1702,7 +2202,8 @@ def main():
         )
         st.pyplot(timeline_figure, clear_figure=True)
 
-    with signal_tab:
+    # ── 2. Signal Review (barcha rollar) ──────────────────────────────────
+    with tabs[tab_idx["📈 Signal Review"]]:
         st.markdown("<div class=\"section-kicker\">Signal Viewer</div><div class=\"section-title\">Ko'p kanalli ko'rinish va spektrogramma</div>", unsafe_allow_html=True)
         total_duration = clean_recording["data"].shape[1] / clean_recording["sfreq"]
         recommended_start = get_recommended_window_start(analysis["events"], preview_seconds, total_duration)
@@ -1717,40 +2218,31 @@ def main():
                 step=float(max(1.0, preview_seconds / 2)),
             )
         with control_col2:
-            channel_limit = int(
-                st.selectbox(
-                    "Ko'rinadigan kanallar",
-                    [4, 6, 8, 10, 12],
-                    index=2 if clean_recording["data"].shape[0] >= 8 else 0,
-                )
-            )
+            channel_limit = int(st.selectbox(
+                "Ko'rinadigan kanallar",
+                [4, 6, 8, 10, 12],
+                index=2 if clean_recording["data"].shape[0] >= 8 else 0,
+            ))
         with control_col3:
             if analysis["events"]:
-                event_options = [f"{event['start']:.1f}-{event['end']:.1f} s" for event in analysis["events"][:12]]
+                event_options = [f"{e['start']:.1f}-{e['end']:.1f} s" for e in analysis["events"][:12]]
                 selected_event = st.selectbox("Tez o'tish", ["Tavsiya etilgan oyna"] + event_options)
                 if selected_event != "Tavsiya etilgan oyna":
                     chosen_index = event_options.index(selected_event)
-                    chosen_event = analysis["events"][chosen_index]
-                    window_start_sec = float(max(0.0, min(chosen_event["start"] - preview_seconds / 3, max_start)))
+                    window_start_sec = float(max(0.0, min(analysis["events"][chosen_index]["start"] - preview_seconds / 3, max_start)))
             else:
                 st.write("")
 
         review_figure = plot_signal_review(
-            raw_recording,
-            clean_recording,
-            analysis["events"],
-            window_start_sec=window_start_sec,
-            preview_seconds=preview_seconds,
-            channel_limit=channel_limit,
+            raw_recording, clean_recording, analysis["events"],
+            window_start_sec=window_start_sec, preview_seconds=preview_seconds, channel_limit=channel_limit,
         )
         st.pyplot(review_figure, clear_figure=True)
-        st.caption("Ko'k timeline oynasi va signal review bir xil vaqt oralig'ini ko'rsatadi. To'q sariq zonalar shubhali segmentlar.")
+        st.caption("Ko'k timeline oynasi va signal review bir xil vaqt oralig'ini ko'rsatadi.")
 
         synced_timeline = plot_event_timeline(
-            analysis["events"],
-            total_duration=total_duration,
-            window_start_sec=window_start_sec,
-            window_duration_sec=preview_seconds,
+            analysis["events"], total_duration=total_duration,
+            window_start_sec=window_start_sec, window_duration_sec=preview_seconds,
         )
         st.pyplot(synced_timeline, clear_figure=True)
 
@@ -1778,7 +2270,8 @@ def main():
             )
             st.dataframe(quality_df, use_container_width=True, hide_index=True)
 
-    with ai_tab:
+    # ── 3. AI Findings (barcha rollar) ────────────────────────────────────
+    with tabs[tab_idx["🤖 AI Findings"]]:
         st.markdown("<div class=\"section-kicker\">Explainable AI</div><div class=\"section-title\">Model topilmalari va klinik xususiyatlar</div>", unsafe_allow_html=True)
         heatmap_figure = plot_band_heatmap(analysis["band_table"])
         st.pyplot(heatmap_figure, clear_figure=True)
@@ -1787,52 +2280,67 @@ def main():
         with col1:
             st.markdown("### Ritm ulushlari")
             summary_df = pd.DataFrame(
-                [{"Band": band_name, "Mean %": round(analysis["band_means"][band_name], 2)} for band_name in BANDS]
+                [{"Band": b, "Mean %": round(analysis["band_means"][b], 2)} for b in BANDS]
             )
             st.dataframe(summary_df, use_container_width=True, hide_index=True)
             st.markdown("### Kanal kesimidagi jadval")
             st.dataframe(analysis["band_table"].round(2), use_container_width=True, hide_index=True)
         with col2:
             st.markdown("### Klinik topilmalar")
-            st.write(f"AI xulosa: **{analysis['label']}**")
-            st.write(f"Seizure probability: **{analysis['seizure_probability']:.1f}%**")
+            st.write(f"Heuristik xulosa: **{analysis['label']}**")
+            st.write(f"Deep Learning xulosa: **{analysis.get('ml_label', 'N/A')}**")
+            ml_prob_val = analysis.get("ml_seizure_prob")
+            ml_prob_txt = f"{ml_prob_val:.1f}%" if ml_prob_val is not None else "N/A"
+            st.write(f"ML Seizure probability: **{ml_prob_txt}**")
+            st.write(f"Heuristik risk: **{analysis['seizure_probability']:.1f}%**")
             st.write(f"Dominant kanal: **{analysis['dominant_channel']}**")
-            st.write(f"Slowing index: **{analysis['slowing_index']:.2f}**")
-            st.write(f"Epileptiform index: **{analysis['epileptiform_index']:.1f}**")
             st.write(f"Normativ profil: **{analysis['normative']['profile_label']}**")
-            st.write(f"Normativ holat: **{analysis['normative']['overall_status']}**")
-            st.write(f"Normativ izoh: **{analysis['normative']['headline']}**")
             st.write(f"Tavsiya: **{analysis['recommendation']}**")
-            st.markdown("### Yosh va jins normasi bilan qiyos")
-            normative_df = pd.DataFrame(analysis["normative"]["rows"])
-            normative_df["value"] = normative_df["value"].map(lambda value: round(float(value), 2))
-            normative_df["z_score"] = normative_df["z_score"].map(lambda value: round(float(value), 2))
-            st.dataframe(normative_df, use_container_width=True, hide_index=True)
             st.markdown("### Segment markerlari")
             if analysis["events"]:
                 for event in analysis["events"][:8]:
-                    channel_name = clean_recording["channel_names"][event["channel_index"]]
-                    st.write(
-                        f"- {event['start']:.1f}-{event['end']:.1f} s | {channel_name} | score {event['score']:.2f}"
-                    )
+                    ch = clean_recording["channel_names"][event["channel_index"]]
+                    st.write(f"- {event['start']:.1f}-{event['end']:.1f} s | {ch} | score {event['score']:.2f}")
             else:
                 st.success("Shubhali segment topilmadi.")
 
-    with registry_tab:
+    # ── 4. Bemor Registri (barcha rollar ko'radi; faqat doctor/admin yozadi) ──
+    with tabs[tab_idx["🗂 Bemor Registri"]]:
         st.markdown("<div class=\"section-kicker\">Clinical Registry</div><div class=\"section-title\">Bemor bazasi va tekshiruvlar tarixi</div>", unsafe_allow_html=True)
+
+        if not can("patients_write"):
+            st.info("ℹ️ Siz faqat ko'rish huquqiga egasiz. Bemor qo'shish yoki tahrirlash uchun Shifokor yoki Admin roli kerak.")
+
         patients_df = load_patients()
         if not patients_df.empty:
             patient_labels = [f"{row.patient_code} - {row.full_name}" for row in patients_df.itertuples(index=False)]
             selected_label = st.selectbox("Registrdan bemor tanlang", patient_labels)
-            if st.button("Tanlangan bemorni formaga yuklash", use_container_width=True):
-                selected_row = patients_df.iloc[patient_labels.index(selected_label)]
-                st.session_state.patient_name = selected_row["full_name"]
-                st.session_state.patient_age = int(selected_row["age"]) if pd.notna(selected_row["age"]) else 30
-                st.session_state.patient_gender = selected_row["gender"] if pd.notna(selected_row["gender"]) else "Erkak"
-                st.session_state.patient_id = selected_row["patient_code"]
-                st.session_state.department = selected_row["department"] if pd.notna(selected_row["department"]) else "Nevrologiya"
-                st.session_state.clinical_note = selected_row["clinical_note"] if pd.notna(selected_row["clinical_note"]) else ""
-                st.rerun()
+
+            load_col, del_col = st.columns([2, 1])
+            with load_col:
+                if st.button("Tanlangan bemorni formaga yuklash", use_container_width=True):
+                    selected_row = patients_df.iloc[patient_labels.index(selected_label)]
+                    st.session_state.patient_name = selected_row["full_name"]
+                    st.session_state.patient_age = int(selected_row["age"]) if pd.notna(selected_row["age"]) else 30
+                    st.session_state.patient_gender = selected_row["gender"] if pd.notna(selected_row["gender"]) else "Erkak"
+                    st.session_state.patient_id = selected_row["patient_code"]
+                    st.session_state.department = selected_row["department"] if pd.notna(selected_row["department"]) else "Nevrologiya"
+                    st.session_state.clinical_note = selected_row["clinical_note"] if pd.notna(selected_row["clinical_note"]) else ""
+                    st.rerun()
+            with del_col:
+                if can("patients_delete"):
+                    if st.button("🗑 Bemorni o'chirish", use_container_width=True, type="secondary"):
+                        selected_row = patients_df.iloc[patient_labels.index(selected_label)]
+                        conn = get_connection()
+                        conn.execute("DELETE FROM patients WHERE patient_code = ?", (selected_row["patient_code"],))
+                        conn.commit()
+                        conn.close()
+                        log_audit("delete_patient", f"code={selected_row['patient_code']}")
+                        st.success("Bemor o'chirildi.")
+                        st.rerun()
+                else:
+                    st.caption("🔒 O'chirish: faqat Admin")
+
             st.dataframe(patients_df, use_container_width=True, hide_index=True)
         else:
             st.info("Hali registrda bemor yo'q.")
@@ -1843,40 +2351,6 @@ def main():
             st.dataframe(studies_df.round(2), use_container_width=True, hide_index=True)
         else:
             st.info("Hali saqlangan study yo'q.")
-
-    with admin_tab:
-        st.markdown("<div class=\"section-kicker\">Reports and Governance</div><div class=\"section-title\">Hisobotlar, audit log va platforma holati</div>", unsafe_allow_html=True)
-        st.text_area("Avtomatik hisobot", value=st.session_state.report_text, height=360)
-        download_col1, download_col2 = st.columns(2)
-        with download_col1:
-            st.download_button(
-                "TXT hisobotni yuklash",
-                data=st.session_state.report_text.encode("utf-8"),
-                file_name=f"eeg_report_{patient['patient_id']}.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
-        with download_col2:
-            st.download_button(
-                "PDF hisobotni yuklash",
-                data=st.session_state.report_pdf,
-                file_name=f"eeg_report_{patient['patient_id']}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-
-        admin_col1, admin_col2 = st.columns([1, 1.2])
-        with admin_col1:
-            render_metric_card("Model versiyasi", MODEL_VERSION)
-            render_metric_card("Bemorlar soni", str(len(load_patients())))
-            render_metric_card("Study soni", str(len(load_recent_studies(limit=200))))
-        with admin_col2:
-            st.markdown("### Audit log")
-            audit_df = load_audit_logs()
-            if not audit_df.empty:
-                st.dataframe(audit_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("Audit log hali bo'sh.")
 
 
 if __name__ == "__main__":
